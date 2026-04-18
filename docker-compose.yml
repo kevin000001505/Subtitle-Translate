@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+    volumes:
+      - ${MEDIA}/media:/media
+      - ./queue_data:/app/data
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ./frontend.html:/usr/share/nginx/html/index.html:ro
+    depends_on:
+      - backend

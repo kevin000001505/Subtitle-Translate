@@ -1,0 +1,1139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Subtitle Service</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #eee;
+        }
+
+        .container { max-width: 980px; margin: 0 auto; padding: 40px 20px; }
+
+        h1 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 8px;
+            background: linear-gradient(90deg, #00d9ff, #00ff88);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle { text-align: center; color: #888; margin-bottom: 36px; }
+
+        /* ── Operation cards ── */
+        .op-selector {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .op-card {
+            background: rgba(255,255,255,0.05);
+            border: 2px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 22px 14px;
+            cursor: pointer;
+            text-align: center;
+            transition: all 0.25s ease;
+            user-select: none;
+        }
+
+        .op-card:hover {
+            background: rgba(255,255,255,0.09);
+            transform: translateY(-2px);
+            border-color: rgba(255,255,255,0.2);
+        }
+
+        .op-card.active {
+            border-color: #00d9ff;
+            background: rgba(0,217,255,0.12);
+            box-shadow: 0 0 22px rgba(0,217,255,0.18);
+        }
+
+        .op-icon { font-size: 2.2rem; margin-bottom: 10px; }
+        .op-title { font-size: 1rem; font-weight: 700; margin-bottom: 5px; color: #ccc; }
+        .op-card.active .op-title { color: #00d9ff; }
+        .op-desc { font-size: 0.8rem; color: #666; line-height: 1.4; }
+        .op-card.active .op-desc { color: #9ad; }
+
+        /* ── Card wrapper ── */
+        .card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .card-title {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #00d9ff;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-title::before {
+            content: '';
+            width: 4px;
+            height: 18px;
+            background: #00d9ff;
+            border-radius: 2px;
+        }
+
+        /* ── Breadcrumb ── */
+        .breadcrumb {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 4px;
+            background: rgba(0,0,0,0.35);
+            padding: 10px 14px;
+            border-radius: 8px;
+            margin-bottom: 18px;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.85rem;
+        }
+
+        .bc-item {
+            color: #00ff88;
+            cursor: pointer;
+            transition: color 0.15s;
+        }
+
+        .bc-item:hover { color: #fff; text-decoration: underline; }
+        .bc-item.current { color: #666; cursor: default; text-decoration: none; }
+        .bc-sep { color: #444; }
+
+        /* ── Folder block grid ── */
+        .blocks-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 14px;
+        }
+
+        .blocks-state {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        /* ── Non-leaf (navigate) block ── */
+        .block-nav {
+            background: rgba(0,0,0,0.28);
+            border: 2px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 16px 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transition: all 0.2s ease;
+        }
+
+        .block-nav:hover {
+            background: rgba(255,255,255,0.07);
+            border-color: rgba(255,255,255,0.22);
+            transform: translateY(-2px);
+        }
+
+        .nav-folder-icon { font-size: 1.9rem; flex-shrink: 0; }
+
+        .nav-info { flex: 1; min-width: 0; }
+
+        .nav-name {
+            font-weight: 600;
+            font-size: 0.92rem;
+            color: #ccc;
+            word-break: break-word;
+            line-height: 1.3;
+            margin-bottom: 4px;
+        }
+
+        .nav-badge { font-size: 0.78rem; color: #666; }
+
+        .nav-arrow {
+            font-size: 1.3rem;
+            color: #444;
+            flex-shrink: 0;
+            transition: color 0.15s;
+        }
+
+        .block-nav:hover .nav-arrow { color: #00d9ff; }
+
+        /* ── Leaf (selectable) block ── */
+        .block-leaf {
+            background: rgba(0,0,0,0.28);
+            border: 2px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+            overflow: hidden;
+        }
+
+        .block-leaf:hover:not(.selected) {
+            border-color: rgba(0,217,255,0.35);
+            background: rgba(0,217,255,0.04);
+        }
+
+        .block-leaf.selected {
+            border-color: #00d9ff;
+            background: rgba(0,217,255,0.1);
+        }
+
+        .leaf-header {
+            padding: 16px 14px 12px;
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .leaf-folder-icon { font-size: 1.9rem; flex-shrink: 0; margin-top: 1px; }
+
+        .leaf-info { flex: 1; min-width: 0; }
+
+        .leaf-name {
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: #ccc;
+            word-break: break-word;
+            line-height: 1.3;
+            margin-bottom: 6px;
+        }
+
+        .block-leaf.selected .leaf-name { color: #fff; }
+
+        .leaf-badges { font-size: 0.78rem; color: #777; }
+        .block-leaf.selected .leaf-badges { color: #9ad; }
+
+        .leaf-check {
+            font-size: 1rem;
+            flex-shrink: 0;
+            opacity: 0;
+            transition: opacity 0.15s;
+            color: #00d9ff;
+            margin-top: 2px;
+        }
+
+        .block-leaf.selected .leaf-check { opacity: 1; }
+
+        /* ── Accordion file list ── */
+        .leaf-files {
+            border-top: 1px solid rgba(255,255,255,0.07);
+            padding: 10px 14px 12px;
+            display: none;
+        }
+
+        .block-leaf.selected .leaf-files { display: block; }
+
+        .file-row {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            padding: 3px 0;
+            font-size: 0.8rem;
+            color: #999;
+        }
+
+        .file-icon { flex-shrink: 0; }
+        .file-name { word-break: break-all; line-height: 1.3; }
+
+        /* ── Settings panels ── */
+        .form-group { margin-bottom: 16px; }
+
+        .field-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #bbb;
+            font-size: 0.9rem;
+        }
+
+        .num-input {
+            padding: 10px 14px;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 8px;
+            background: rgba(0,0,0,0.35);
+            color: #fff;
+            font-size: 1rem;
+            width: 150px;
+            transition: border-color 0.2s;
+        }
+
+        .num-input:focus { outline: none; border-color: #00d9ff; }
+
+        .field-hint { margin-top: 6px; font-size: 0.82rem; color: #666; }
+
+        /* ── Priority options ── */
+        .priority-list { display: grid; gap: 10px; margin-top: 6px; }
+
+        .p-option {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 13px 16px;
+            background: rgba(0,0,0,0.3);
+            border: 2px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .p-option:hover { background: rgba(255,255,255,0.05); }
+
+        .p-option.selected {
+            border-color: #00d9ff;
+            background: rgba(0,217,255,0.1);
+        }
+
+        .p-option input[type="radio"] { display: none; }
+
+        .p-radio {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            border: 2px solid rgba(255,255,255,0.3);
+            flex-shrink: 0;
+            transition: all 0.2s;
+        }
+
+        .p-option.selected .p-radio { background: #00d9ff; border-color: #00d9ff; }
+
+        .p-label { font-weight: 600; font-size: 0.92rem; margin-bottom: 2px; }
+        .p-hint { font-size: 0.8rem; color: #777; }
+        .p-option.selected .p-hint { color: #9ad; }
+
+        /* ── Action button ── */
+        .action-btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(90deg, #00ff88, #00d9ff);
+            color: #1a1a2e;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.05rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            margin-bottom: 20px;
+        }
+
+        .action-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 24px rgba(0,255,136,0.35);
+        }
+
+        .action-btn:disabled {
+            background: rgba(255,255,255,0.1);
+            color: #555;
+            cursor: not-allowed;
+        }
+
+        /* ── Status list ── */
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+        }
+
+        .status-item.processing {
+            background: rgba(243,156,18,0.12);
+            border-left: 4px solid #f39c12;
+            color: #f39c12;
+        }
+
+        .status-item.success {
+            background: rgba(0,255,136,0.08);
+            border-left: 4px solid #00ff88;
+            color: #00ff88;
+        }
+
+        .status-item.error {
+            background: rgba(231,76,60,0.12);
+            border-left: 4px solid #e74c3c;
+            color: #e74c3c;
+        }
+
+        .status-name { font-weight: 600; flex-shrink: 0; }
+
+        .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(243,156,18,0.3);
+            border-top-color: #f39c12;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            flex-shrink: 0;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .hidden { display: none !important; }
+
+        /* ── Retry button ── */
+        .retry-btn {
+            margin-left: auto;
+            flex-shrink: 0;
+            padding: 4px 12px;
+            background: rgba(243,156,18,0.15);
+            border: 1px solid rgba(243,156,18,0.5);
+            border-radius: 6px;
+            color: #f39c12;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .retry-btn:hover {
+            background: rgba(243,156,18,0.28);
+            border-color: #f39c12;
+        }
+
+        /* ── History card ── */
+        .history-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 4px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.85rem;
+        }
+
+        .history-row:last-child { border-bottom: none; }
+
+        .history-op-badge {
+            font-size: 0.72rem;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: rgba(0,217,255,0.1);
+            color: #00d9ff;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .history-name {
+            font-weight: 600;
+            color: #ccc;
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .history-path {
+            font-size: 0.75rem;
+            color: #555;
+            font-family: 'Monaco', 'Consolas', monospace;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 260px;
+        }
+
+        .history-time {
+            font-size: 0.78rem;
+            color: #666;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        /* ── Sync progress card ── */
+        .sync-progress-card {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 10px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+
+        .sync-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .sync-folder-name { font-weight: 600; flex: 1; font-size: 0.95rem; }
+
+        .sync-status-text { font-size: 0.85rem; color: #888; white-space: nowrap; }
+
+        .sync-overall-bar {
+            background: rgba(255,255,255,0.08);
+            border-radius: 4px;
+            height: 6px;
+            margin-bottom: 12px;
+            overflow: hidden;
+        }
+
+        .sync-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d9ff, #00ff88);
+            border-radius: 4px;
+            transition: width 0.6s ease;
+        }
+
+        .sync-files-list { display: flex; flex-direction: column; gap: 2px; }
+
+        .sync-file-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 4px;
+            font-size: 0.82rem;
+            color: #999;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+        }
+
+        .sync-file-row:last-child { border-bottom: none; }
+
+        .sync-file-row.done   { color: #00ff88; }
+        .sync-file-row.failed { color: #e74c3c; }
+        .sync-file-row.active { color: #f39c12; }
+
+        .sync-method-badge {
+            font-size: 0.72rem;
+            padding: 1px 6px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.08);
+            color: #666;
+            margin-left: auto;
+            flex-shrink: 0;
+        }
+
+        .spinner-sm {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid rgba(243,156,18,0.3);
+            border-top-color: #f39c12;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            flex-shrink: 0;
+        }
+
+        @media (max-width: 640px) {
+            h1 { font-size: 1.9rem; }
+            .container { padding: 22px 14px; }
+            .op-selector { grid-template-columns: 1fr; }
+            .blocks-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <h1>AI Subtitle Service</h1>
+    <p class="subtitle">Translate, shift, and sync subtitles for your media files</p>
+
+    <!-- ── Operation selector ── -->
+    <div class="op-selector">
+        <div class="op-card active" data-op="translate" onclick="selectOp('translate')">
+            <div class="op-icon">🌐</div>
+            <div class="op-title">Translate</div>
+            <div class="op-desc">English → Traditional Chinese<br>powered by Gemini AI</div>
+        </div>
+        <div class="op-card" data-op="shift" onclick="selectOp('shift')">
+            <div class="op-icon">⏱️</div>
+            <div class="op-title">Shift Timing</div>
+            <div class="op-desc">Nudge subtitles earlier<br>or later by milliseconds</div>
+        </div>
+        <div class="op-card" data-op="sync" onclick="selectOp('sync')">
+            <div class="op-icon">🔄</div>
+            <div class="op-title">Sync &amp; Align</div>
+            <div class="op-desc">Auto-sync subtitles<br>with video audio</div>
+        </div>
+    </div>
+
+    <!-- ── Browser card ── -->
+    <div class="card">
+        <div class="card-title">Browse &amp; Select Folders</div>
+        <div class="breadcrumb" id="breadcrumb"></div>
+        <div id="blocks-area">
+            <div class="blocks-state">Loading…</div>
+        </div>
+    </div>
+
+    <!-- ── Settings card ── -->
+    <div class="card">
+
+        <!-- Translate (no extra fields) -->
+        <div id="translate-settings">
+            <div class="card-title">Translate Subtitles</div>
+            <p style="color:#888;font-size:0.9rem;">
+                Select one or more folders above. Each folder will be scanned for
+                <code style="color:#00ff88">.en.srt</code> files — or English subtitles
+                will be extracted from MKV/MP4 if needed — then translated to Traditional Chinese.
+            </p>
+        </div>
+
+        <!-- Shift timing -->
+        <div id="shift-settings" class="hidden">
+            <div class="card-title">Timing Offset</div>
+            <div class="form-group">
+                <label class="field-label">Milliseconds to shift</label>
+                <input type="number" id="shift-offset" class="num-input" value="-500">
+                <span style="color:#888;margin-left:8px;font-size:0.9rem;">ms</span>
+                <p class="field-hint">
+                    Negative = earlier &nbsp;·&nbsp; Positive = later.
+                    Applied to all <code style="color:#00ff88">.zh-tw.srt</code> files inside each selected folder.
+                </p>
+            </div>
+        </div>
+
+        <!-- Sync alignment -->
+        <div id="sync-settings" class="hidden">
+            <div class="card-title">Alignment Method</div>
+            <div class="priority-list">
+                <label class="p-option selected" onclick="selectPriority(this)">
+                    <input type="radio" name="sync-priority" value="auto" checked>
+                    <div class="p-radio"></div>
+                    <div>
+                        <div class="p-label">🤖 Auto (Default)</div>
+                        <div class="p-hint">Intelligently picks the best method based on available files</div>
+                    </div>
+                </label>
+                <label class="p-option" onclick="selectPriority(this)">
+                    <input type="radio" name="sync-priority" value="srt">
+                    <div class="p-radio"></div>
+                    <div>
+                        <div class="p-label">⚡ SRT-Only</div>
+                        <div class="p-hint">Faster — aligns using subtitle metadata only (5–10 min)</div>
+                    </div>
+                </label>
+                <label class="p-option" onclick="selectPriority(this)">
+                    <input type="radio" name="sync-priority" value="audio">
+                    <div class="p-radio"></div>
+                    <div>
+                        <div class="p-label">🎤 Audio-Based</div>
+                        <div class="p-hint">More accurate — correlates audio waveform (15–30 min)</div>
+                    </div>
+                </label>
+            </div>
+        </div>
+
+    </div>
+
+    <button class="action-btn" id="action-btn" disabled onclick="runOp()">
+        Select folders above to continue
+    </button>
+    <div id="status-wrap"></div>
+
+    <!-- ── History card ── -->
+    <div class="card hidden" id="history-card">
+        <div class="card-title">History</div>
+        <div id="history-list"></div>
+    </div>
+
+</div>
+<script>
+    const API_BASE   = 'http://localhost:8000';
+    const MEDIA_ROOT = '/media';
+    const MEDIA_RE   = /\.(srt|mkv|mp4|avi|mov|wav|mp3|m4a|flac|aac)$/i;
+
+    // ── State ────────────────────────────────────────────────────
+    let breadcrumb    = [{ name: 'media', path: MEDIA_ROOT }];
+    let currentBlocks = [];       // { name, path, isLeaf, contents, badgeText }
+    let selectedPaths = new Set();
+    let currentOp     = 'translate';
+
+    const OP_LABELS = { translate: 'Translate',    shift: 'Shift Timing', sync: 'Sync & Align' };
+    const OP_VERBS  = { translate: 'Translating',  shift: 'Shifting',     sync: 'Syncing'      };
+    const OP_EMOJI  = { translate: '✨',            shift: '⏱️',           sync: '🔄'           };
+    const ENDPOINTS = { translate: '/translate',   shift: '/shift',       sync: '/sync'        };
+
+    // ── Operation selector ───────────────────────────────────────
+    function selectOp(op) {
+        currentOp = op;
+        document.querySelectorAll('.op-card').forEach(c => c.classList.remove('active'));
+        document.querySelector(`.op-card[data-op="${op}"]`).classList.add('active');
+        ['translate', 'shift', 'sync'].forEach(id =>
+            document.getElementById(`${id}-settings`).classList.toggle('hidden', id !== op)
+        );
+        updateActionBtn();
+    }
+
+    function selectPriority(el) {
+        document.querySelectorAll('.p-option').forEach(o => o.classList.remove('selected'));
+        el.classList.add('selected');
+        el.querySelector('input[type="radio"]').checked = true;
+    }
+
+    // ── API ──────────────────────────────────────────────────────
+    async function fetchDir(path) {
+        const res = await fetch(`${API_BASE}/list-directory?path=${encodeURIComponent(path)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        return data.items || [];
+    }
+
+    // ── Badge computation ────────────────────────────────────────
+    function computeBadges(items) {
+        let videos = 0, subs = 0, audio = 0, folders = 0;
+        for (const it of items) {
+            if (it.type === 'folder') { folders++; continue; }
+            const n = it.name.toLowerCase();
+            if (/\.(mkv|mp4|avi|mov)$/.test(n))       videos++;
+            else if (n.endsWith('.srt'))                subs++;
+            else if (/\.(wav|mp3|m4a|flac|aac)$/.test(n)) audio++;
+        }
+        const parts = [];
+        if (folders > 0) parts.push(`📁 ${folders}`);
+        if (videos  > 0) parts.push(`🎬 ${videos}`);
+        if (subs    > 0) parts.push(`📝 ${subs}`);
+        if (audio   > 0) parts.push(`🔊 ${audio}`);
+        return { text: parts.join('  ·  ') || '(empty)', folders };
+    }
+
+    function fileIcon(name) {
+        const n = name.toLowerCase();
+        if (/\.(mkv|mp4|avi|mov)$/.test(n))        return '🎬';
+        if (n.endsWith('.srt'))                     return '📝';
+        if (/\.(wav|mp3|m4a|flac|aac)$/.test(n))   return '🔊';
+        return '📄';
+    }
+
+    // ── Level loading ─────────────────────────────────────────────
+    async function loadLevel(path) {
+        selectedPaths.clear();
+        updateActionBtn();
+        setArea('<div class="blocks-state">Loading…</div>');
+        renderBreadcrumb();
+
+        let topItems;
+        try {
+            topItems = await fetchDir(path);
+        } catch (err) {
+            setArea(`<div class="blocks-state" style="color:#e74c3c">❌ ${esc(err.message)}</div>`);
+            return;
+        }
+
+        const folders = topItems
+            .filter(i => i.type === 'folder')
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        if (folders.length === 0) {
+            setArea('<div class="blocks-state">No subfolders found here</div>');
+            return;
+        }
+
+        setArea('<div class="blocks-state">Loading folder contents…</div>');
+
+        // Load each subfolder's contents in parallel for badge display
+        const settled = await Promise.allSettled(folders.map(f => fetchDir(f.path)));
+
+        currentBlocks = folders.map((f, i) => {
+            const items    = settled[i].status === 'fulfilled' ? settled[i].value : [];
+            const badges   = computeBadges(items);
+            const isLeaf   = badges.folders === 0;
+            // Only keep media files for the accordion
+            const contents = items
+                .filter(it => it.type === 'file' && MEDIA_RE.test(it.name))
+                .sort((a, b) => a.name.localeCompare(b.name));
+            return { name: f.name, path: f.path, isLeaf, contents, badgeText: badges.text };
+        });
+
+        renderBlocks();
+    }
+
+    // ── Rendering ─────────────────────────────────────────────────
+    function renderBreadcrumb() {
+        document.getElementById('breadcrumb').innerHTML =
+            breadcrumb.map((b, i) => {
+                const sep  = i > 0 ? '<span class="bc-sep"> / </span>' : '';
+                const last = i === breadcrumb.length - 1;
+                if (last) return `${sep}<span class="bc-item current">${esc(b.name)}</span>`;
+                return `${sep}<span class="bc-item" onclick="navTo(${i})">${esc(b.name)}</span>`;
+            }).join('');
+    }
+
+    function renderBlocks() {
+        const html = currentBlocks.map((b, i) =>
+            b.isLeaf ? leafBlockHTML(b, i) : navBlockHTML(b, i)
+        ).join('');
+        setArea(`<div class="blocks-grid">${html}</div>`);
+    }
+
+    function navBlockHTML(b, i) {
+        return `
+            <div class="block-nav" onclick="navigateInto(${i})" title="${esc(b.path)}">
+                <div class="nav-folder-icon">📁</div>
+                <div class="nav-info">
+                    <div class="nav-name">${esc(b.name)}</div>
+                    <div class="nav-badge">${esc(b.badgeText)}</div>
+                </div>
+                <div class="nav-arrow">›</div>
+            </div>`;
+    }
+
+    function leafBlockHTML(b, i) {
+        const sel      = selectedPaths.has(b.path);
+        const selClass = sel ? ' selected' : '';
+        const fileRows = b.contents.map(f =>
+            `<div class="file-row">
+                <span class="file-icon">${fileIcon(f.name)}</span>
+                <span class="file-name">${esc(f.name)}</span>
+            </div>`
+        ).join('') || '<div style="color:#666;font-size:0.8rem;padding:2px 0">No media files found</div>';
+
+        return `
+            <div class="block-leaf${selClass}" onclick="toggleSelect(${i})" title="${esc(b.path)}">
+                <div class="leaf-header">
+                    <div class="leaf-folder-icon">📁</div>
+                    <div class="leaf-info">
+                        <div class="leaf-name">${esc(b.name)}</div>
+                        <div class="leaf-badges">${esc(b.badgeText)}</div>
+                    </div>
+                    <div class="leaf-check">✓</div>
+                </div>
+                <div class="leaf-files">${fileRows}</div>
+            </div>`;
+    }
+
+    function setArea(html) {
+        document.getElementById('blocks-area').innerHTML = html;
+    }
+
+    // ── Navigation ────────────────────────────────────────────────
+    function navigateInto(idx) {
+        const b = currentBlocks[idx];
+        breadcrumb.push({ name: b.name, path: b.path });
+        loadLevel(b.path);
+    }
+
+    function navTo(idx) {
+        breadcrumb = breadcrumb.slice(0, idx + 1);
+        loadLevel(breadcrumb[breadcrumb.length - 1].path);
+    }
+
+    // ── Selection ─────────────────────────────────────────────────
+    function toggleSelect(idx) {
+        const b = currentBlocks[idx];
+        if (selectedPaths.has(b.path)) {
+            selectedPaths.delete(b.path);
+        } else {
+            selectedPaths.add(b.path);
+        }
+
+        // Re-render just this one block in-place (avoids full re-render flicker)
+        const grid = document.querySelector('.blocks-grid');
+        if (grid && grid.children[idx]) {
+            grid.children[idx].outerHTML = leafBlockHTML(b, idx);
+        }
+
+        updateActionBtn();
+    }
+
+    // ── Action button ─────────────────────────────────────────────
+    function updateActionBtn() {
+        const btn   = document.getElementById('action-btn');
+        const count = selectedPaths.size;
+        if (count === 0) {
+            btn.disabled = true;
+            btn.textContent = 'Select folders above to continue';
+        } else {
+            btn.disabled = false;
+            const noun = count === 1 ? 'folder' : 'folders';
+            btn.textContent = `${OP_LABELS[currentOp]}: ${count} ${noun} ${OP_EMOJI[currentOp]}`;
+        }
+    }
+
+    // ── Run operation ─────────────────────────────────────────────
+    async function runOp() {
+        const paths = [...selectedPaths];
+        if (paths.length === 0) return;
+
+        const btn  = document.getElementById('action-btn');
+        const wrap = document.getElementById('status-wrap');
+        btn.disabled = true;
+        wrap.innerHTML = '';
+
+        if (currentOp === 'sync') {
+            const results = await Promise.all(paths.map(path => runSyncWithProgress(path, wrap)));
+            paths.forEach((path, i) => { if (results[i]) selectedPaths.delete(path); });
+        } else {
+            const extra = {};
+            if (currentOp === 'shift') {
+                extra.offset_ms = parseInt(document.getElementById('shift-offset').value) || -500;
+            }
+
+            const folderNames = paths.map(p => p.split('/').filter(Boolean).pop());
+            folderNames.forEach(name => addStatus(wrap, name, 'processing', `${OP_VERBS[currentOp]}…`));
+
+            const settled = await Promise.allSettled(
+                paths.map(path =>
+                    fetch(`${API_BASE}${ENDPOINTS[currentOp]}`, {
+                        method:  'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body:    JSON.stringify({ path, ...extra })
+                    }).then(r => r.json())
+                )
+            );
+
+            wrap.innerHTML = '';
+            settled.forEach((res, i) => {
+                const path = paths[i];
+                const name = folderNames[i];
+                if (res.status === 'fulfilled') {
+                    const d  = res.value;
+                    const ok = ['done', 'processing_async', 'success'].includes(d.status);
+                    if (ok) {
+                        selectedPaths.delete(path);
+                        addStatus(wrap, name, 'success', d.message || d.status);
+                    } else {
+                        addStatusWithRetry(wrap, name, 'error', d.message || d.status || JSON.stringify(d),
+                            () => retrySingle(path, name, extra, wrap));
+                    }
+                } else {
+                    addStatusWithRetry(wrap, name, 'error', res.reason?.message || 'Request failed',
+                        () => retrySingle(path, name, extra, wrap));
+                }
+            });
+        }
+
+        renderBlocks();
+        updateActionBtn();
+        loadHistory();
+        btn.disabled = false;
+    }
+
+    // Re-run a single translate/shift path; replaces its status row in wrap
+    async function retrySingle(path, name, extra, wrap) {
+        const placeholder = document.createElement('div');
+        placeholder.className = 'status-item processing';
+        placeholder.innerHTML = `<div class="spinner"></div><span class="status-name">${esc(name)}</span>: ${OP_VERBS[currentOp]}…`;
+        wrap.appendChild(placeholder);
+
+        let d;
+        try {
+            const res = await fetch(`${API_BASE}${ENDPOINTS[currentOp]}`, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ path, ...extra })
+            });
+            d = await res.json();
+        } catch (err) {
+            d = { status: 'error', message: err.message || 'Request failed' };
+        }
+
+        const ok = ['done', 'processing_async', 'success'].includes(d?.status);
+        if (ok) {
+            selectedPaths.delete(path);
+            placeholder.className = 'status-item success';
+            placeholder.innerHTML = `✅ <span class="status-name">${esc(name)}</span>: ${esc(d.message || d.status)}`;
+        } else {
+            placeholder.remove();
+            addStatusWithRetry(wrap, name, 'error', d?.message || d?.status || 'Failed',
+                () => retrySingle(path, name, extra, wrap));
+        }
+        renderBlocks();
+        updateActionBtn();
+        loadHistory();
+    }
+
+    // ── Sync with live progress ───────────────────────────────────
+    // Returns true if job completed successfully (status="done"), false otherwise
+    async function runSyncWithProgress(path, wrap) {
+        const priority = document.querySelector('input[name="sync-priority"]:checked')?.value || 'auto';
+        const name     = path.split('/').filter(Boolean).pop();
+
+        const card = document.createElement('div');
+        card.className = 'sync-progress-card';
+        card.innerHTML = `
+            <div class="sync-header">
+                <div class="spinner"></div>
+                <span class="sync-folder-name">${esc(name)}</span>
+                <span class="sync-status-text">Starting…</span>
+            </div>
+            <div class="sync-overall-bar"><div class="sync-bar-fill" style="width:0%"></div></div>
+            <div class="sync-files-list"></div>`;
+        wrap.appendChild(card);
+
+        let jobId;
+        try {
+            const res  = await fetch(`${API_BASE}/sync`, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ path, priority })
+            });
+            const data = await res.json();
+            if (data.status === 'error') {
+                finishSyncCard(card, false, data.message);
+                addSyncRetry(card, path, wrap);
+                return false;
+            }
+            jobId = data.job_id;
+        } catch (err) {
+            finishSyncCard(card, false, err.message || 'Request failed');
+            addSyncRetry(card, path, wrap);
+            return false;
+        }
+
+        let finalJob = null;
+        await new Promise(resolve => {
+            const es = new EventSource(`${API_BASE}/sync/progress/${jobId}`);
+            es.onmessage = e => {
+                const job = JSON.parse(e.data);
+                updateSyncCard(card, job);
+                if (job.status === 'done' || job.status === 'error') {
+                    finalJob = job;
+                    es.close();
+                    resolve();
+                }
+            };
+            es.onerror = () => { es.close(); resolve(); };
+        });
+
+        const success = finalJob?.status === 'done';
+        if (!success || (finalJob?.failed?.length > 0)) {
+            addSyncRetry(card, path, wrap);
+        }
+        return success;
+    }
+
+    function addSyncRetry(card, path, wrap) {
+        const btn = document.createElement('button');
+        btn.className = 'retry-btn';
+        btn.style.cssText = 'display:block;margin-top:12px;width:100%;padding:8px';
+        btn.textContent = '↩ Retry';
+        btn.onclick = async () => {
+            card.remove();
+            const ok = await runSyncWithProgress(path, wrap);
+            if (ok) selectedPaths.delete(path);
+            renderBlocks();
+            updateActionBtn();
+            loadHistory();
+        };
+        card.appendChild(btn);
+    }
+
+    function updateSyncCard(card, job) {
+        const statusText = card.querySelector('.sync-status-text');
+        const barFill    = card.querySelector('.sync-bar-fill');
+        const filesList  = card.querySelector('.sync-files-list');
+        const headerIcon = card.querySelector('.sync-header > :first-child');
+
+        const pct = job.total > 0 ? Math.round((job.current / job.total) * 100) : 0;
+        barFill.style.width = `${pct}%`;
+
+        if (job.status === 'done') {
+            statusText.textContent = job.message || 'Done';
+            if (headerIcon.classList.contains('spinner')) headerIcon.outerHTML = '<span>✅</span>';
+        } else if (job.status === 'error') {
+            statusText.textContent = job.message || 'Error';
+            if (headerIcon.classList.contains('spinner')) headerIcon.outerHTML = '<span>❌</span>';
+        } else if (job.total > 0) {
+            statusText.textContent = `${job.current} / ${job.total} files`;
+        }
+
+        if (job.files && job.files.length > 0) {
+            filesList.innerHTML = job.files.map(f => {
+                const stateClass = f.status === 'done'       ? 'done'   :
+                                   f.status === 'failed'     ? 'failed' :
+                                   f.status === 'processing' ? 'active' : '';
+                const icon = f.status === 'done'       ? '✅' :
+                             f.status === 'failed'     ? '❌' :
+                             f.status === 'processing' ? '<span class="spinner-sm"></span>' : '⏳';
+                const method = f.method
+                    ? `<span class="sync-method-badge">${f.method === 'srt' ? '⚡ srt' : '🎤 audio'}</span>`
+                    : '';
+                const err = f.error
+                    ? ` — <span style="color:#e74c3c;font-size:0.78rem">${esc(f.error)}</span>` : '';
+                return `<div class="sync-file-row ${stateClass}">${icon} <span style="flex:1">${esc(f.name)}${err}</span>${method}</div>`;
+            }).join('');
+        }
+    }
+
+    function finishSyncCard(card, success, msg) {
+        card.querySelector('.sync-header > :first-child').outerHTML = success ? '<span>✅</span>' : '<span>❌</span>';
+        card.querySelector('.sync-status-text').textContent = msg;
+    }
+
+    function addStatus(wrap, name, type, msg) {
+        const div = document.createElement('div');
+        div.className = `status-item ${type}`;
+        const icon = type === 'processing' ? '<div class="spinner"></div>'
+                   : type === 'success'    ? '✅' : '❌';
+        div.innerHTML = `${icon} <span class="status-name">${esc(name)}</span>: ${esc(msg)}`;
+        wrap.appendChild(div);
+        return div;
+    }
+
+    function addStatusWithRetry(wrap, name, type, msg, retryFn) {
+        const div = document.createElement('div');
+        div.className = `status-item ${type}`;
+        div.style.display = 'flex';
+        div.style.alignItems = 'center';
+        div.style.gap = '10px';
+        div.innerHTML = `❌ <span class="status-name">${esc(name)}</span>: <span style="flex:1">${esc(msg)}</span>`;
+        const btn = document.createElement('button');
+        btn.className = 'retry-btn';
+        btn.textContent = '↩ Retry';
+        btn.onclick = () => { div.remove(); retryFn(); };
+        div.appendChild(btn);
+        wrap.appendChild(div);
+    }
+
+    // ── History ───────────────────────────────────────────────────
+    async function loadHistory() {
+        try {
+            const res  = await fetch(`${API_BASE}/history`);
+            const data = await res.json();
+            const card = document.getElementById('history-card');
+            const list = document.getElementById('history-list');
+
+            if (!data.history || data.history.length === 0) {
+                card.classList.add('hidden');
+                return;
+            }
+
+            card.classList.remove('hidden');
+            const OP_ICON = { translate: '🌐', shift: '⏱️', sync: '🔄' };
+            list.innerHTML = data.history.map(h => {
+                const name = h.path.split('/').filter(Boolean).pop() || h.path;
+                const date = new Date(h.timestamp * 1000).toLocaleString();
+                const icon = OP_ICON[h.operation] || '📋';
+                return `<div class="history-row">
+                    <span>${icon}</span>
+                    <span class="history-name" title="${esc(h.path)}">${esc(name)}</span>
+                    <span class="history-op-badge">${esc(h.operation)}</span>
+                    <span class="history-path" title="${esc(h.path)}">${esc(h.path)}</span>
+                    <span class="history-time">${esc(date)}</span>
+                </div>`;
+            }).join('');
+        } catch (_) { /* silently fail */ }
+    }
+
+    // ── Utility ───────────────────────────────────────────────────
+    function esc(str) {
+        const d = document.createElement('div');
+        d.textContent = String(str ?? '');
+        return d.innerHTML;
+    }
+
+    // ── Init ──────────────────────────────────────────────────────
+    selectOp('translate');
+    loadLevel(MEDIA_ROOT);
+    loadHistory();
+</script>
+</body>
+</html>
