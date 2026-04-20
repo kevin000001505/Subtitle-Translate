@@ -14,7 +14,7 @@ import json
 import uuid
 import subprocess
 from contextlib import asynccontextmanager
-from google import genai
+from translate_gemma import TranslateGemmaClient
 
 # ================= CONFIGURATION =================
 TARGET_LANG = "zh-TW"
@@ -22,7 +22,13 @@ TARGET_LANG = "zh-TW"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# TranslateGemma (local llama.cpp server)
+translate_gemma_client = TranslateGemmaClient()
+
+# Which translator to use: "translatemgemma" or "gemini"
+TRANSLATOR_BACKEND = os.getenv("TRANSLATOR_BACKEND", "translatemgemma")
 
 # --- PLAYBACK SYNC CONTROL ---
 # Set to -1000 to show Chinese subtitles 1 second EARLIER.
@@ -389,24 +395,30 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
 
         for attempt in range(3):
             try:
-                response = await client.aio.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt
-                )
-                log_api_call()
-                
+                if TRANSLATOR_BACKEND == "gemini" and client is not None:
+                    response = await client.aio.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=prompt
+                    )
+                    log_api_call()
+                    result_text = response.text
+                else:
+                    result_text = await translate_gemma_client.translate(batch_text, context_text)
+                    if result_text is None:
+                        raise Exception("TranslateGemma returned None")
+
                 progress_counter['completed'] += 1
                 current = progress_counter['completed']
                 if current % 10 == 0 or current == total_chunks:
                     bar = get_progress_bar(current, total_chunks)
                     logger.info(f"PROGRESS: {bar} ({current}/{total_chunks})")
-                
-                return response.text
+
+                return result_text
             except Exception as e:
                 wait_time = (attempt + 1) * 2
                 if attempt == 2:
                     logger.error(f"Failed chunk {index}: {e}")
-                    return None 
+                    return None
                 await asyncio.sleep(wait_time)
 
 async def translate_single_subtitle(en_sub_path: str) -> bool:
