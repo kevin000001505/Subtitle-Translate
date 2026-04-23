@@ -16,6 +16,6 @@ services:
     ports:
       - "8081:80"
     volumes:
-      - ./frontend.html:/usr/share/nginx/html/index.html:ro
+      - ./frontend:/usr/share/nginx/html:ro
     depends_on:
       - backend

@@ -16,13 +16,18 @@ import subprocess
 from contextlib import asynccontextmanager
 from translate_gemma import TranslateGemmaClient
 
+try:
+    from google import genai
+except ImportError:
+    genai = None
+
 # ================= CONFIGURATION =================
 TARGET_LANG = "zh-TW"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+client = genai.Client(api_key=GEMINI_API_KEY) if (GEMINI_API_KEY and genai) else None
 
 # TranslateGemma (local llama.cpp server)
 translate_gemma_client = TranslateGemmaClient()
@@ -65,8 +70,18 @@ class SyncRequest(BaseModel):
 
 # ================= SYNC JOB TRACKING =================
 
-# job_id -> { status, total, current, files: [{name, status, method?, error?}], message?, synced?, failed? }
+# job_id -> { status, total, current, files: [{name, status, method?, error?}], message?, synced?, failed?, finished_at? }
 sync_jobs: dict = {}
+SYNC_JOB_TTL_SECONDS = 3600  # drop finished jobs after 1h
+
+def _prune_sync_jobs():
+    now = time.time()
+    stale = [
+        jid for jid, j in sync_jobs.items()
+        if j.get("finished_at") and (now - j["finished_at"]) > SYNC_JOB_TTL_SECONDS
+    ]
+    for jid in stale:
+        sync_jobs.pop(jid, None)
 
 
 async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: str):
@@ -77,16 +92,18 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
     job = sync_jobs[job_id]
 
     if not os.path.isdir(folder_path):
-        job["status"] = "error"
-        job["message"] = f"Folder not found: {folder_path}"
+        job["status"]      = "error"
+        job["message"]     = f"Folder not found: {folder_path}"
+        job["finished_at"] = time.time()
         return
 
     video_files = sorted(
         f for f in os.listdir(folder_path) if f.lower().endswith((".mkv", ".mp4"))
     )
     if not video_files:
-        job["status"] = "error"
-        job["message"] = "No video files (.mkv/.mp4) found in folder"
+        job["status"]      = "error"
+        job["message"]     = "No video files (.mkv/.mp4) found in folder"
+        job["finished_at"] = time.time()
         return
 
     # Build work list — only files that have a matching zh-TW.srt
@@ -100,8 +117,9 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
             logger.warning(f"SYNC: No zh-TW.srt for {video_file}, skipping")
 
     if not files:
-        job["status"] = "error"
-        job["message"] = "No zh-TW.srt files found to sync"
+        job["status"]      = "error"
+        job["message"]     = "No zh-TW.srt files found to sync"
+        job["finished_at"] = time.time()
         return
 
     job["total"]   = len(files)
@@ -151,8 +169,12 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
             failed.append({"file": video_file, "error": "timed out"})
             logger.error(f"SYNC: Timeout for {video_file}")
         except FileNotFoundError:
-            job["status"]  = "error"
-            job["message"] = "ffsubsync is not installed"
+            file_entry["status"] = "failed"
+            file_entry["error"]  = "ffsubsync not installed"
+            failed.append({"file": video_file, "error": "ffsubsync not installed"})
+            job["status"]      = "error"
+            job["message"]     = "ffsubsync is not installed"
+            job["finished_at"] = time.time()
             return
         except Exception as e:
             file_entry["status"] = "failed"
@@ -162,10 +184,11 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
 
         job["current"] += 1
 
-    job["status"]  = "done"
-    job["synced"]  = synced
-    job["failed"]  = failed
-    job["message"] = f"Synced {len(synced)} file(s), {len(failed)} failed"
+    job["status"]      = "done"
+    job["synced"]      = synced
+    job["failed"]      = failed
+    job["message"]     = f"Synced {len(synced)} file(s), {len(failed)} failed"
+    job["finished_at"] = time.time()
     logger.info(f"SYNC: {job['message']}")
     if synced:
         log_history(folder_path, "sync")
@@ -361,19 +384,29 @@ def get_progress_bar(current, total, length=20):
     bar = "█" * filled_length + "-" * (length - filled_length)
     return f"[{bar}] {int(percent * 100)}%"
 
+_ID_BLOCK_RE = re.compile(
+    r'\[(\d+)\]\s*(.*?)(?=(?:\r?\n)\s*\[\d+\]|\Z)',
+    re.DOTALL,
+)
+
 def parse_gemini_response(response_text):
     """
-    NEW PARSER: Uses Regex Split to handle multi-line subtitles correctly.
+    Parse lines of the form `[ID] translated text`. Supports multi-line
+    translations; stops each entry at the next `[ID]` on its own line,
+    so trailing prose after the final entry is bounded by newline-breaks.
     """
     updates = {}
-    parts = re.split(r'\[(\d+)\]', response_text)
-    for i in range(1, len(parts), 2):
+    for match in _ID_BLOCK_RE.finditer(response_text):
         try:
-            sub_id = int(parts[i])
-            text = parts[i+1].strip()
-            updates[sub_id] = text
-        except (ValueError, IndexError):
+            sub_id = int(match.group(1))
+        except ValueError:
             continue
+        text = match.group(2).strip()
+        # Drop any trailing non-translation tail on the last entry:
+        # if the text contains a blank line, keep only the first block.
+        if "\n\n" in text:
+            text = text.split("\n\n", 1)[0].strip()
+        updates[sub_id] = text
     return updates
 
 async def process_single_chunk(index, batch, context_text, total_chunks, progress_counter):
@@ -575,9 +608,14 @@ async def process_movie(input_path: str):
             mark_done_in_queue(input_path)
             return
 
-        # Skip if zh-TW already exists for this specific file
-        base    = en_sub_path[:-len(".en.srt")] if en_sub_path.endswith(".en.srt") else en_sub_path[:-4]
-        zh_path = f"{base}.zh-TW.srt"
+        # Skip if zh-TW already exists for this specific file.
+        # Must match the save-path logic in translate_single_subtitle.
+        if en_sub_path.endswith(".en.srt"):
+            zh_path = en_sub_path.replace(".en.srt", ".zh-TW.srt")
+        elif en_sub_path.endswith(".srt"):
+            zh_path = f"{en_sub_path[:-4]}(AI).zh-TW.srt"
+        else:
+            zh_path = en_sub_path + ".zh-TW.srt"
         if os.path.exists(zh_path):
             logger.info(f"SKIP: {zh_path} already exists.")
             mark_done_in_queue(input_path)
@@ -621,10 +659,10 @@ async def trigger_translation(req: SubtitleRequest, background_tasks: Background
     used = get_calls_last_24h()
     if used > DAILY_LIMIT:
         add_to_queue(req.path)
-        return {"status": "queued_limit_reached"}
-    
+        return {"status": "queued_limit_reached", "message": "Daily limit reached — queued"}
+
     background_tasks.add_task(process_movie, req.path)
-    return {"status": "processing_async"}
+    return {"status": "processing_async", "message": "Translation started in background"}
 
 @app.post("/shift")
 async def shift_subtitle(req: ShiftRequest):
@@ -675,6 +713,7 @@ async def sync_folder(req: SyncRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(req.path):
         return {"status": "error", "message": "Path not found"}
 
+    _prune_sync_jobs()
     job_id = str(uuid.uuid4())
     sync_jobs[job_id] = {
         "status":  "starting",

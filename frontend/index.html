@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Subtitle Service</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="container">
+
+    <h1>AI Subtitle Service</h1>
+    <p class="subtitle">Translate, shift, and sync subtitles for your media files</p>
+
+    <!-- Operation selector -->
+    <div class="op-selector" id="op-selector">
+        <div class="op-card active" data-op="translate">
+            <div class="op-icon">🌐</div>
+            <div class="op-title">Translate</div>
+            <div class="op-desc">English → Traditional Chinese<br>powered by Gemini AI</div>
+        </div>
+        <div class="op-card" data-op="shift">
+            <div class="op-icon">⏱️</div>
+            <div class="op-title">Shift Timing</div>
+            <div class="op-desc">Nudge subtitles earlier<br>or later by milliseconds</div>
+        </div>
+        <div class="op-card" data-op="sync">
+            <div class="op-icon">🔄</div>
+            <div class="op-title">Sync &amp; Align</div>
+            <div class="op-desc">Auto-sync subtitles<br>with video audio</div>
+        </div>
+    </div>
+
+    <!-- Folder browser -->
+    <div class="card">
+        <div class="card-title">Browse &amp; Select Folders</div>
+        <div class="breadcrumb" id="breadcrumb"></div>
+        <div id="blocks-area">
+            <div class="blocks-state">Loading…</div>
+        </div>
+    </div>
+
+    <!-- Per-operation settings -->
+    <div class="card">
+
+        <div id="translate-settings">
+            <div class="card-title">Translate Subtitles</div>
+            <p style="color:#888;font-size:0.9rem;">
+                Select one or more folders above. Each folder will be scanned for
+                <span class="code-chip">.en.srt</span> files — or English subtitles
+                will be extracted from MKV/MP4 if needed — then translated to Traditional Chinese.
+            </p>
+        </div>
+
+        <div id="shift-settings" class="hidden">
+            <div class="card-title">Timing Offset</div>
+            <div class="form-group">
+                <label class="field-label" for="shift-offset">Milliseconds to shift</label>
+                <input type="number" id="shift-offset" class="num-input" value="-500">
+                <span style="color:#888;margin-left:8px;font-size:0.9rem;">ms</span>
+                <p class="field-hint">
+                    Negative = earlier &nbsp;·&nbsp; Positive = later.
+                    Applied to all <span class="code-chip">.zh-tw.srt</span> files inside each selected folder.
+                </p>
+            </div>
+        </div>
+
+        <div id="sync-settings" class="hidden">
+            <div class="card-title">Alignment Method</div>
+            <div class="priority-list" id="priority-list">
+                <label class="p-option selected">
+                    <input type="radio" name="sync-priority" value="auto" checked>
+                    <div class="p-radio"></div>
+                    <div>
+                        <div class="p-label">🤖 Auto (Default)</div>
+                        <div class="p-hint">Intelligently picks the best method based on available files</div>
+                    </div>
+                </label>
+                <label class="p-option">
+                    <input type="radio" name="sync-priority" value="srt">
+                    <div class="p-radio"></div>
+                    <div>
+                        <div class="p-label">⚡ SRT-Only</div>
+                        <div class="p-hint">Faster — aligns using subtitle metadata only (5–10 min)</div>
+                    </div>
+                </label>
+                <label class="p-option">
+                    <input type="radio" name="sync-priority" value="audio">
+                    <div class="p-radio"></div>
+                    <div>
+                        <div class="p-label">🎤 Audio-Based</div>
+                        <div class="p-hint">More accurate — correlates audio waveform (15–30 min)</div>
+                    </div>
+                </label>
+            </div>
+        </div>
+
+    </div>
+
+    <button class="action-btn" id="action-btn" disabled>
+        Select folders above to continue
+    </button>
+    <div id="status-wrap"></div>
+
+    <div class="card hidden" id="history-card">
+        <div class="card-title">History</div>
+        <div id="history-list"></div>
+    </div>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

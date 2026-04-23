@@ -20,8 +20,9 @@ class TranslateGemmaClient:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
-        self._last_request_time = 0
+        self._last_request_time = 0.0
         self._min_interval = 0.1  # 100ms between requests to avoid overwhelming local server
+        self._rate_lock = asyncio.Lock()
 
     async def translate(self, batch_text: str, context_text: str = "") -> str | None:
         url = f"{self.base_url}/v1/chat/completions"
@@ -60,13 +61,17 @@ class TranslateGemmaClient:
 
         for attempt in range(3):
             try:
-                # Rate limiting
-                elapsed = time.time() - self._last_request_time
-                if elapsed < self._min_interval:
-                    await asyncio.sleep(self._min_interval - elapsed)
+                # Rate limiting — serialize the pre-call wait across coroutines
+                async with self._rate_lock:
+                    elapsed = time.time() - self._last_request_time
+                    if elapsed < self._min_interval:
+                        await asyncio.sleep(self._min_interval - elapsed)
+                    self._last_request_time = time.time()
 
-                response = requests.post(url, headers=self.headers, json=payload, timeout=120)
-                self._last_request_time = time.time()
+                response = await asyncio.to_thread(
+                    requests.post, url,
+                    headers=self.headers, json=payload, timeout=120,
+                )
 
                 if response.status_code != 200:
                     logger.warning(f"TranslateGemma error: {response.status_code} - {response.text[:200]}")
