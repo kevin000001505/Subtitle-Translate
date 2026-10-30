@@ -7,3 +7,5 @@ services:
       - ./main.py:/app/main.py:ro
       - ./translate_gemma.py:/app/translate_gemma.py:ro
       - ./subtitle_files.py:/app/subtitle_files.py:ro
+      - ./media_servers.py:/app/media_servers.py:ro
+      - ./jobs.py:/app/jobs.py:ro
