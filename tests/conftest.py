@@ -161,7 +161,7 @@ class FakeHttp:
             pass
         resp = _Resp()
         resp.status_code = body if isinstance(body, int) else 200
-        resp.headers = {"Content-Type": "image/jpeg"}
+        resp.headers = {"Content-Type": "image/png"}
         resp.content = body if isinstance(body, bytes) else b""
         resp.json = lambda: body
         return resp

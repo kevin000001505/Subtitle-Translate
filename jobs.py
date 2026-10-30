@@ -9,6 +9,7 @@ import sqlite3
 import time
 
 ACTIVE = ("queued", "running")
+_ACTIVE_SQL = "status IN ('queued', 'running')"
 
 _COLUMNS = ("id", "op", "server", "item_id", "title", "video_path", "target_lang",
             "backend", "model", "overwrite", "params", "status", "progress",
@@ -46,9 +47,11 @@ def add(db_file, *, op, video_path, target_lang, title="", server=None, item_id=
     queued or running is returned instead of a duplicate."""
     now = time.time()
     with _connect(db_file) as conn:
+        params_json = json.dumps(params or {}, sort_keys=True)
         existing = conn.execute(
-            f"SELECT * FROM jobs WHERE op = ? AND video_path = ? AND target_lang = ? "
-            f"AND status IN {ACTIVE}", (op, video_path, target_lang)).fetchone()
+            f"SELECT * FROM jobs WHERE op = ? AND video_path = ? AND target_lang = ? AND {_ACTIVE_SQL}"
+            " AND COALESCE(backend, '') = ? AND COALESCE(model, '') = ? AND overwrite = ? AND params = ?",
+            (op, video_path, target_lang, backend or "", model or "", int(overwrite), params_json)).fetchone()
         if existing:
             return _row(existing), False
         cursor = conn.execute(
@@ -56,7 +59,7 @@ def add(db_file, *, op, video_path, target_lang, title="", server=None, item_id=
             " overwrite, params, status, progress, message, created_at, updated_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', ?, ?)",
             (op, server, item_id, title, video_path, target_lang, backend, model,
-             int(overwrite), json.dumps(params or {}), now, now))
+             int(overwrite), params_json, now, now))
         job = conn.execute("SELECT * FROM jobs WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return _row(job), True
 
@@ -94,8 +97,8 @@ def get(db_file, job_id) -> dict | None:
 def recent(db_file, limit=100) -> list[dict]:
     """Active jobs first (oldest first), then the latest finished ones."""
     with _connect(db_file) as conn:
-        active = conn.execute(f"SELECT * FROM jobs WHERE status IN {ACTIVE} ORDER BY id").fetchall()
-        done = conn.execute(f"SELECT * FROM jobs WHERE status NOT IN {ACTIVE} ORDER BY id DESC LIMIT ?",
+        active = conn.execute(f"SELECT * FROM jobs WHERE {_ACTIVE_SQL} ORDER BY id").fetchall()
+        done = conn.execute(f"SELECT * FROM jobs WHERE NOT {_ACTIVE_SQL} ORDER BY id DESC LIMIT ?",
                             (limit,)).fetchall()
         return [_row(r) for r in active] + [_row(r) for r in done]
 
@@ -103,10 +106,10 @@ def recent(db_file, limit=100) -> list[dict]:
 def active_targets(db_file) -> set[tuple[str, str]]:
     """(video_path, target_lang) of every queued or running job, for badges."""
     with _connect(db_file) as conn:
-        rows = conn.execute(f"SELECT video_path, target_lang FROM jobs WHERE status IN {ACTIVE}").fetchall()
+        rows = conn.execute(f"SELECT video_path, target_lang FROM jobs WHERE {_ACTIVE_SQL}").fetchall()
         return {(r["video_path"], r["target_lang"]) for r in rows}
 
 
 def clear_finished(db_file):
     with _connect(db_file) as conn:
-        conn.execute(f"DELETE FROM jobs WHERE status NOT IN {ACTIVE}")
+        conn.execute(f"DELETE FROM jobs WHERE NOT {_ACTIVE_SQL}")

@@ -6,7 +6,7 @@ can open (/media/Movies/X.mkv). A path no rule covers maps to None, and the
 item is shown as unavailable instead of being translated in the wrong place.
 """
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import requests
 
@@ -56,31 +56,43 @@ class Title:
     year: int | None
     path: str | None = None   # movies only: backend path of the video
     server_path: str | None = None
-    episodes: list[Episode] = field(default_factory=list)
 
 
 class MediaServerError(Exception):
     pass
 
 
-class Jellyfin:
-    name = "jellyfin"
-    label = "Jellyfin"
+class _Server:
+    name = label = token_header = ""
 
-    def __init__(self, url: str, api_key: str, path_map: PathMap, http=None):
+    def __init__(self, url: str, token: str, path_map: PathMap, http=None):
         self.url = url.rstrip("/")
-        self.headers = {"X-Emby-Token": api_key, "Accept": "application/json"}
+        self.headers = {self.token_header: token, "Accept": "application/json"}
         self.path_map = path_map
         self.http = http or requests.Session()
 
-    def _call(self, method, path, params=None, raw=False):
+    def _request(self, method, path, params=None):
         try:
             response = self.http.request(method, f"{self.url}{path}", params=params,
                                          headers=self.headers, timeout=TIMEOUT)
         except requests.RequestException as e:
-            raise MediaServerError(f"Jellyfin is unreachable: {e}") from e
+            raise MediaServerError(f"{self.label} is unreachable at {self.url} ({type(e).__name__})") from e
         if response.status_code >= 400:
-            raise MediaServerError(f"Jellyfin answered {response.status_code} for {path}")
+            raise MediaServerError(f"{self.label} answered HTTP {response.status_code} for {path}")
+        return response
+
+
+def _by_episode(episodes):
+    return sorted(episodes, key=lambda e: (e.season, e.number))
+
+
+class Jellyfin(_Server):
+    name = "jellyfin"
+    label = "Jellyfin"
+    token_header = "X-Emby-Token"
+
+    def _call(self, method, path, params=None, raw=False):
+        response = self._request(method, path, params)
         return response if raw else response.json()
 
     def _episode(self, item) -> Episode:
@@ -122,14 +134,12 @@ class Jellyfin:
         by_show: dict[str, list[Episode]] = {}
         for item in data.get("Items", []):
             by_show.setdefault(item.get("SeriesId", ""), []).append(self._episode(item))
-        for episodes in by_show.values():
-            episodes.sort(key=lambda e: (e.season, e.number))
-        return by_show
+        return {show: _by_episode(episodes) for show, episodes in by_show.items()}
 
     def episodes(self, show_id: str) -> list[Episode]:
         data = self._call("GET", f"/Shows/{show_id}/Episodes", params={"Fields": "Path"})
         episodes = [self._episode(item) for item in data.get("Items", [])]
-        return sorted(episodes, key=lambda e: (e.season, e.number))
+        return _by_episode(episodes)
 
     def poster(self, item_id: str):
         response = self._call("GET", f"/Items/{item_id}/Images/Primary",
@@ -143,24 +153,13 @@ class Jellyfin:
         }, raw=True)
 
 
-class Plex:
+class Plex(_Server):
     name = "plex"
     label = "Plex"
-
-    def __init__(self, url: str, token: str, path_map: PathMap, http=None):
-        self.url = url.rstrip("/")
-        self.headers = {"X-Plex-Token": token, "Accept": "application/json"}
-        self.path_map = path_map
-        self.http = http or requests.Session()
+    token_header = "X-Plex-Token"
 
     def _call(self, method, path, params=None, raw=False):
-        try:
-            response = self.http.request(method, f"{self.url}{path}", params=params,
-                                         headers=self.headers, timeout=TIMEOUT)
-        except requests.RequestException as e:
-            raise MediaServerError(f"Plex is unreachable: {e}") from e
-        if response.status_code >= 400:
-            raise MediaServerError(f"Plex answered {response.status_code} for {path}")
+        response = self._request(method, path, params)
         return response if raw else response.json().get("MediaContainer", {})
 
     @staticmethod
@@ -205,14 +204,12 @@ class Plex:
             container = self._call("GET", f"/library/sections/{key}/all", params={"type": 4})
             for item in container.get("Metadata", []):
                 by_show.setdefault(str(item.get("grandparentRatingKey", "")), []).append(self._episode(item))
-        for episodes in by_show.values():
-            episodes.sort(key=lambda e: (e.season, e.number))
-        return by_show
+        return {show: _by_episode(episodes) for show, episodes in by_show.items()}
 
     def episodes(self, show_id: str) -> list[Episode]:
         container = self._call("GET", f"/library/metadata/{show_id}/allLeaves")
         episodes = [self._episode(item) for item in container.get("Metadata", [])]
-        return sorted(episodes, key=lambda e: (e.season, e.number))
+        return _by_episode(episodes)
 
     def poster(self, item_id: str):
         response = self._call("GET", f"/library/metadata/{item_id}/thumb", raw=True)

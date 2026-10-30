@@ -62,7 +62,7 @@ def test_jellyfin_poster_and_refresh():
     http = FakeJellyfinHttp(jellyfin_routes())
     server = jellyfin(http)
 
-    assert server.poster("m1") == (b"poster-bytes", "image/jpeg")
+    assert server.poster("m1") == (b"poster-bytes", "image/png")
     server.refresh("m1")
     assert http.calls[-1]["method"] == "POST" and http.calls[-1]["path"] == "/Items/m1/Refresh"
 
@@ -122,7 +122,7 @@ def test_plex_episodes_are_ordered_with_backend_paths():
 def test_plex_poster_and_refresh():
     http = FakeHttp(dict(PLEX_ROUTES))
     server = plex(http)
-    assert server.poster("10") == (b"plex-poster", "image/jpeg")
+    assert server.poster("10") == (b"plex-poster", "image/png")
     server.refresh("10")
     assert http.calls[-1]["method"] == "PUT"
 
