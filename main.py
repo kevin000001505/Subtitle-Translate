@@ -76,8 +76,9 @@ logger = logging.getLogger("SubtitleAPI")
 sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 # A BCP-47 style code such as "ja" or "zh-TW". It becomes part of the
-# subtitle file name, so anything else (spaces, slashes, dots) is refused.
-LangCode = Annotated[str, Field(pattern=r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")]
+# subtitle file name, so anything else (spaces, slashes, dots) is refused,
+# and it is capped at the 35 characters RFC 5646 asks tags to fit in.
+LangCode = Annotated[str, Field(pattern=r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$", max_length=35)]
 
 class SubtitleRequest(BaseModel):
     path: str

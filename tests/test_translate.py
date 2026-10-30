@@ -224,3 +224,22 @@ def test_a_subtitle_queued_mid_job_at_the_daily_limit_keeps_its_target_language(
     asyncio.run(main.run_next_queued_job())
 
     assert (media / "Movie.ja.srt").exists()
+
+
+def test_an_upper_case_EN_subtitle_with_an_existing_translation_is_skipped(media, llama):
+    (media / "Movie.EN.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.zh-TW.srt").write_text("keep me")
+
+    translate(media)
+
+    assert llama.requests == []
+    assert sorted(p.name for p in media.iterdir()) == ["Movie.EN.srt", "Movie.zh-TW.srt"]
+
+
+def test_the_translate_endpoint_rejects_an_over_long_language_code(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    response = translate(media, target_lang="zh" + "-Hant" * 8)
+
+    assert response.status_code == 422
+    assert llama.requests == []
