@@ -315,10 +315,18 @@ def test_a_single_english_subtitle_path_translates_that_file_not_its_neighbour(m
     assert sorted(p.name for p in media.iterdir()) == ["A.en.srt", "A.zh-TW.srt", "B.en.srt", "B.zh-TW.srt"]
 
 
-def test_a_video_path_uses_the_english_subtitle_next_to_it(media, llama):
+def test_a_video_path_uses_an_english_subtitle_in_its_folder(media, llama):
     (media / "Movie.en.srt").write_text(SAMPLE_SRT)
     (media / "Movie.mkv").write_bytes(b"")
 
     translate(media / "Movie.mkv")
 
     assert (media / "Movie.zh-TW.srt").exists()
+
+
+def test_translategemma_is_told_the_source_is_english(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert llama.requests[0]["json"]["messages"][0]["content"][0]["source_lang_code"] == "en"
