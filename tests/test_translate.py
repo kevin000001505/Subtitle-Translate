@@ -283,3 +283,14 @@ def test_a_chosen_gemini_translator_without_an_api_key_writes_nothing(media, lla
                       translator=main.Translator(backend="gemini", model="gemini-2.5-pro"))
 
     assert not (media / "Movie.ja.srt").exists()
+
+
+def test_a_gemini_default_without_an_api_key_still_translates_locally(media, llama, monkeypatch):
+    assert main.client is None
+    monkeypatch.setattr(main, "TRANSLATOR_BACKEND", "gemini")
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert [r["json"]["model"] for r in llama.requests] == ["translatemgemma"]
+    assert lines(media / "Movie.zh-TW.srt")[0] == (500, 1500, "zh-TW: Hello")
