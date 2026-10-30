@@ -1,12 +1,20 @@
 import asyncio
+import os
 import shutil
 import subprocess
 import re
 
 import pytest
 
-import main
-import translate_gemma
+# The app reads these at import time. Clear them so the suite runs against
+# the code defaults, never against a developer's shell or .env (and never
+# calls the real Gemini API).
+for _name in ("GEMINI_API_KEY", "GEMINI_MODEL", "TRANSLATOR_BACKEND",
+              "TRANSLATE_GEMMA_URL", "TRANSLATE_GEMMA_MODEL", "TRANSLATE_GEMMA_API_KEY"):
+    os.environ.pop(_name, None)
+
+import main  # noqa: E402
+import translate_gemma  # noqa: E402
 
 SAMPLE_SRT = """1
 00:00:01,000 --> 00:00:02,000
