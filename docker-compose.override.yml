@@ -1,4 +1,9 @@
 services:
   backend:
+    # Live-edit the backend without rebuilding. Mount every module main.py
+    # imports, so an image built from older code never runs a newer main.py
+    # against stale modules.
     volumes:
       - ./main.py:/app/main.py:ro
+      - ./translate_gemma.py:/app/translate_gemma.py:ro
+      - ./subtitle_files.py:/app/subtitle_files.py:ro
