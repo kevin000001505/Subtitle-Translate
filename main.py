@@ -1,7 +1,8 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Annotated
 import uvicorn
 import os
 import pysubs2
@@ -74,18 +75,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("SubtitleAPI")
 sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
+# A BCP-47 style code such as "ja" or "zh-TW". It becomes part of the
+# subtitle file name, so anything else (spaces, slashes, dots) is refused.
+LangCode = Annotated[str, Field(pattern=r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")]
+
 class SubtitleRequest(BaseModel):
     path: str
+    target_lang: LangCode = DEFAULT_TARGET_LANG
 
 class ShiftRequest(BaseModel):
     path: str  # can be a file or folder
     offset_ms: int = 0
-    target_lang: str = DEFAULT_TARGET_LANG
+    target_lang: LangCode = DEFAULT_TARGET_LANG
 
 class SyncRequest(BaseModel):
     path: str  # folder path
     priority: str = "auto"  # "srt", "audio", or "auto"
-    target_lang: str = DEFAULT_TARGET_LANG
+    target_lang: LangCode = DEFAULT_TARGET_LANG
 
 
 
@@ -685,7 +691,7 @@ async def trigger_translation(req: SubtitleRequest, background_tasks: Background
         add_to_queue(req.path)
         return {"status": "queued_limit_reached", "message": "Daily limit reached — queued"}
 
-    background_tasks.add_task(process_movie, req.path)
+    background_tasks.add_task(process_movie, req.path, target_lang=req.target_lang)
     return {"status": "processing_async", "message": "Translation started in background"}
 
 @app.post("/shift")

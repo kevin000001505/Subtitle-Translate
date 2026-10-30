@@ -152,3 +152,20 @@ def test_a_single_subtitle_file_already_translated_to_the_requested_language_is_
 
     assert llama.requests == []
     assert (media / "Movie.ja.srt").read_text() == "keep me"
+
+
+def test_the_translate_endpoint_accepts_a_target_language(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media, target_lang="ja")
+
+    assert (media / "Movie.ja.srt").exists()
+
+
+def test_the_translate_endpoint_rejects_a_language_code_that_is_not_a_language(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    response = translate(media, target_lang="zh TW")
+
+    assert response.status_code == 422
+    assert llama.requests == []

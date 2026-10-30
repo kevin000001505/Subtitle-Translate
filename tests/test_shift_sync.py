@@ -106,3 +106,19 @@ def test_syncing_a_folder_that_only_has_the_requested_language(media, monkeypatc
 
     assert final["status"] == "done"
     assert final["synced"] == ["Movie.mkv"]
+
+
+def test_shifting_rejects_a_language_code_that_is_not_a_language(media):
+    response = TestClient(main.app).post(
+        "/shift", json={"path": str(media), "offset_ms": 1000, "target_lang": "zh TW"}
+    )
+
+    assert response.status_code == 422
+
+
+def test_syncing_rejects_a_language_code_that_is_not_a_language(media):
+    response = TestClient(main.app).post(
+        "/sync", json={"path": str(media), "target_lang": "../ja"}
+    )
+
+    assert response.status_code == 422
