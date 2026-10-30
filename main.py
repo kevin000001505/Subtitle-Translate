@@ -232,6 +232,9 @@ def init_db():
                  (id INTEGER PRIMARY KEY, path TEXT, status TEXT, added_at REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS history
                  (id INTEGER PRIMARY KEY, path TEXT, operation TEXT, timestamp REAL)''')
+    queue_columns = [row[1] for row in c.execute("PRAGMA table_info(job_queue)")]
+    if "target_lang" not in queue_columns:
+        c.execute(f"ALTER TABLE job_queue ADD COLUMN target_lang TEXT NOT NULL DEFAULT '{DEFAULT_TARGET_LANG}'")
     conn.commit()
     conn.close()
 
@@ -256,12 +259,14 @@ def get_calls_last_24h():
     conn.close()
     return count
 
-def add_to_queue(path):
+def add_to_queue(path, target_lang=DEFAULT_TARGET_LANG):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id FROM job_queue WHERE path = ? AND status = 'PENDING'", (path,))
+    c.execute("SELECT id FROM job_queue WHERE path = ? AND target_lang = ? AND status = 'PENDING'",
+              (path, target_lang))
     if c.fetchone() is None:
-        c.execute("INSERT INTO job_queue (path, status, added_at) VALUES (?, 'PENDING', ?)", (path, time.time()))
+        c.execute("INSERT INTO job_queue (path, status, added_at, target_lang) VALUES (?, 'PENDING', ?, ?)",
+                  (path, time.time(), target_lang))
         conn.commit()
         logger.info(f"QUEUE: Added {path} to queue.")
     conn.close()
@@ -269,20 +274,20 @@ def add_to_queue(path):
 def pop_from_queue():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, path FROM job_queue WHERE status = 'PENDING' ORDER BY added_at ASC LIMIT 1")
+    c.execute("SELECT id, path, target_lang FROM job_queue WHERE status = 'PENDING' ORDER BY added_at ASC LIMIT 1")
     row = c.fetchone()
     if row:
         c.execute("UPDATE job_queue SET status = 'PROCESSING' WHERE id = ?", (row[0],))
         conn.commit()
         conn.close()
-        return row[1]
+        return row[1], row[2]
     conn.close()
     return None
 
-def mark_done_in_queue(path):
+def mark_done_in_queue(path, target_lang=DEFAULT_TARGET_LANG):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("DELETE FROM job_queue WHERE path = ?", (path,))
+    c.execute("DELETE FROM job_queue WHERE path = ? AND target_lang = ?", (path, target_lang))
     conn.commit()
     conn.close()
 
@@ -516,7 +521,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     used_today = get_calls_last_24h()
     if (used_today + total_chunks) > DAILY_LIMIT:
         logger.warning(f"LIMIT HIT: Queueing {en_sub_path}")
-        add_to_queue(en_sub_path)
+        add_to_queue(en_sub_path, target_lang)
         return False
 
     logger.info(f"Translating {total_chunks} chunks (Concurrency: {CONCURRENCY_LIMIT})...")
@@ -573,7 +578,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
     """
     if not os.path.exists(input_path):
         logger.error(f"Path not found: {input_path}")
-        mark_done_in_queue(input_path)
+        mark_done_in_queue(input_path, target_lang)
         return
 
     # Check if input is a folder (series) or file
@@ -586,7 +591,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
         video_files = [f for f in os.listdir(movie_dir) if f.lower().endswith((".mkv", ".mp4"))]
         if not srt_files and not video_files:
             logger.warning(f"SKIP: No .en.srt or MKV/MP4 files found in {movie_dir}")
-            mark_done_in_queue(input_path)
+            mark_done_in_queue(input_path, target_lang)
             return
 
         logger.info(f"SERIES: Found {len(srt_files)} .en.srt and {len(video_files)} video file(s).")
@@ -629,7 +634,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
 
         logger.info(f"SERIES: Completed {movie_dir}")
         log_history(input_path, "translate")
-        mark_done_in_queue(input_path)
+        mark_done_in_queue(input_path, target_lang)
     else:
         # Single file mode — resolve to an .en.srt and translate it
         movie_dir = os.path.dirname(input_path)
@@ -641,30 +646,31 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
 
         if en_sub_path is None:
             logger.warning(f"SKIP: Could not find or extract an English subtitle in {movie_dir}")
-            mark_done_in_queue(input_path)
+            mark_done_in_queue(input_path, target_lang)
             return
 
         # Skip if the translation already exists for this specific file.
         out_path = output_subtitle_path(en_sub_path, target_lang)
         if os.path.exists(out_path):
             logger.info(f"SKIP: {out_path} already exists.")
-            mark_done_in_queue(input_path)
+            mark_done_in_queue(input_path, target_lang)
             return
 
         success = await translate_single_subtitle(en_sub_path, translator, target_lang)
         if success:
             log_history(input_path, "translate")
-        mark_done_in_queue(input_path)
+        mark_done_in_queue(input_path, target_lang)
 
 # ================= SCHEDULER & APP =================
 
 async def run_next_queued_job():
     used = get_calls_last_24h()
     if (DAILY_LIMIT - used) > 100:
-        next_file = pop_from_queue()
-        if next_file:
-            logger.info(f"MONITOR: Starting queued job: {next_file}")
-            await process_movie(next_file)
+        next_job = pop_from_queue()
+        if next_job:
+            next_file, target_lang = next_job
+            logger.info(f"MONITOR: Starting queued job: {next_file} ({target_lang})")
+            await process_movie(next_file, target_lang=target_lang)
 
 async def queue_monitor():
     while True:
@@ -691,7 +697,7 @@ app.add_middleware(
 async def trigger_translation(req: SubtitleRequest, background_tasks: BackgroundTasks):
     used = get_calls_last_24h()
     if used > DAILY_LIMIT:
-        add_to_queue(req.path)
+        add_to_queue(req.path, req.target_lang)
         return {"status": "queued_limit_reached", "message": "Daily limit reached — queued"}
 
     background_tasks.add_task(process_movie, req.path, target_lang=req.target_lang)

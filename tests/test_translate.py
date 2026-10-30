@@ -169,3 +169,58 @@ def test_the_translate_endpoint_rejects_a_language_code_that_is_not_a_language(m
 
     assert response.status_code == 422
     assert llama.requests == []
+
+
+def test_a_request_queued_at_the_daily_limit_keeps_its_target_language(media, llama, monkeypatch):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    monkeypatch.setattr(main, "DAILY_LIMIT", -1)
+    assert translate(media, target_lang="ja").json()["status"] == "queued_limit_reached"
+    monkeypatch.setattr(main, "DAILY_LIMIT", 9500)
+
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.ja.srt").exists()
+    assert not (media / "Movie.zh-TW.srt").exists()
+
+
+def test_the_same_title_queued_in_two_languages_gets_both(media, llama, monkeypatch):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    monkeypatch.setattr(main, "DAILY_LIMIT", -1)
+    translate(media, target_lang="zh-TW")
+    translate(media, target_lang="ja")
+    monkeypatch.setattr(main, "DAILY_LIMIT", 9500)
+
+    asyncio.run(main.run_next_queued_job())
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.zh-TW.srt").exists()
+    assert (media / "Movie.ja.srt").exists()
+
+
+def test_jobs_queued_before_languages_were_stored_still_run_as_zh_tw(media, llama, tmp_path, monkeypatch):
+    import sqlite3
+    old_db = tmp_path / "old-queue.db"
+    conn = sqlite3.connect(old_db)
+    conn.execute("CREATE TABLE job_queue (id INTEGER PRIMARY KEY, path TEXT, status TEXT, added_at REAL)")
+    conn.execute("INSERT INTO job_queue (path, status, added_at) VALUES (?, 'PENDING', 0)", (str(media),))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(main, "DB_FILE", str(old_db))
+    main.init_db()
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.zh-TW.srt").exists()
+
+
+def test_a_subtitle_queued_mid_job_at_the_daily_limit_keeps_its_target_language(media, llama, monkeypatch):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    monkeypatch.setattr(main, "DAILY_LIMIT", 0)
+    translate(media, target_lang="ja")
+    assert not (media / "Movie.ja.srt").exists()
+    monkeypatch.setattr(main, "DAILY_LIMIT", 9500)
+
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.ja.srt").exists()
