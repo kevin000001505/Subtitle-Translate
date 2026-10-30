@@ -59,6 +59,11 @@ button { cursor: pointer; }
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
 }
 .kind-filter { display: flex; gap: 4px; }
+.icon-btn {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    width: 34px; height: 34px; font-size: 1.05rem; color: var(--muted);
+}
+.icon-btn:hover { color: var(--text); }
 
 /* ── Toolbar ────────────────────────────────────────────── */
 .toolbar {
@@ -129,6 +134,7 @@ main { padding: 20px 24px; }
 .badge.missing { background: var(--missing); color: #e8ecf4; }
 .badge.running { background: var(--running); }
 .badge.unavailable { background: #334155; color: var(--muted); }
+.badge.unmapped { background: #7c2d12; color: #fed7aa; }
 .pill { position: static; display: inline-block; }
 
 /* ── Show dialog ────────────────────────────────────────── */

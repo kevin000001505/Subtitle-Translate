@@ -25,8 +25,9 @@ const OPS = {
 
 const STATUS_LABEL = {
     done: 'Done', partial: 'Partial', missing: 'Missing',
-    running: 'Running', unavailable: 'No file',
+    running: 'Running', unavailable: 'No file', unmapped: 'Path not mapped',
 };
+const SOURCE_LANG = 'en';
 
 const state = {
     config: null,
@@ -80,6 +81,7 @@ function renderServerTabs() {
             state.server = s.name;
             prefs.set('server', s.name);
             state.selection.clear();
+            updateRunButton();
             renderServerTabs();
             loadLibrary();
         };
@@ -96,7 +98,7 @@ function renderLanguages() {
     select.value = state.lang;
     select.onchange = () => {
         state.lang = select.value;
-        prefs.set('lang', state.lang);
+        updateRunButton();
         loadLibrary();
     };
 }
@@ -152,7 +154,7 @@ function setOp(op) {
 }
 
 // 5. Library grid ──────────────────────────────────────────────
-async function loadLibrary() {
+async function loadLibrary(refresh = false) {
     const status = $('library-state');
     if (!state.server) {
         status.textContent = 'No media server configured. Set JELLYFIN_URL or PLEX_URL in .env and restart the backend.';
@@ -163,7 +165,7 @@ async function loadLibrary() {
     status.textContent = 'Loading library…';
     status.classList.remove('hidden');
     try {
-        const body = await api(`/library/${state.server}?lang=${encodeURIComponent(state.lang)}`);
+        const body = await api(`/library/${state.server}?lang=${encodeURIComponent(state.lang)}${refresh ? '&refresh=true' : ''}`);
         state.titles = body.titles;
         renderGrid();
     } catch (e) {
@@ -197,7 +199,7 @@ function renderGrid() {
 function card(t) {
     const key = selectionKey(t.kind, t.id);
     const node = el('article', {
-        className: `card ${t.status === 'unavailable' ? 'unavailable' : ''} ${state.selection.has(key) ? 'selected' : ''}`,
+        className: `card ${unreachable(t) ? 'unavailable' : ''} ${state.selection.has(key) ? 'selected' : ''}`,
     });
     node.dataset.key = key;
 
@@ -221,11 +223,19 @@ function card(t) {
     ));
 
     node.onclick = () => {
-        if (t.status === 'unavailable') return toast(`${t.name} has no file this app can reach`);
+        if (t.status === 'unmapped') return toast(unmappedHint(t.name, t.server_path));
+        if (t.status === 'unavailable') return toast(`${t.name} has no file on the server`);
         toggleSelection({ kind: t.kind, id: t.id, label: t.name });
         node.classList.toggle('selected', state.selection.has(key));
     };
     return node;
+}
+
+function unreachable(t) { return t.status === 'unavailable' || t.status === 'unmapped'; }
+
+function unmappedHint(name, serverPath) {
+    const variable = `${state.server.toUpperCase()}_PATH_MAP`;
+    return `${name}: ${serverPath} is outside ${variable} in .env, so this app can't reach the file`;
 }
 
 // 6. Selection ─────────────────────────────────────────────────
@@ -251,7 +261,9 @@ function updateRunButton() {
     $('clear-selection').classList.toggle('hidden', !n);
     const run = $('run');
     run.textContent = n ? `${OPS[state.op].label} ${n} selected` : OPS[state.op].label;
-    run.disabled = !n || (state.op === 'translate' && !$('model').value);
+    const translatingToSource = state.op === 'translate' && state.lang === SOURCE_LANG;
+    run.disabled = !n || translatingToSource || (state.op === 'translate' && !$('model').value);
+    run.title = translatingToSource ? 'English is the source language: pick another language to translate into' : '';
 }
 
 function clearSelection() {
@@ -286,6 +298,14 @@ async function openShow(t) {
     }
 }
 
+async function reloadShowEpisodes() {
+    try {
+        const body = await api(`/library/${state.server}/shows/${encodeURIComponent(state.show.id)}?lang=${encodeURIComponent(state.lang)}`);
+        state.show.seasons = body.seasons;
+        renderSeasons(body.seasons);
+    } catch { /* keep the old rows */ }
+}
+
 function clearEpisodesOf(showId) {
     for (const [key, item] of state.selection) if (item.kind === 'episode' && item.show_id === showId) state.selection.delete(key);
 }
@@ -296,7 +316,7 @@ function renderSeasons(seasons) {
     const wholeShow = state.selection.has(selectionKey('show', show.id));
     box.innerHTML = '';
     for (const s of seasons) {
-        const available = s.episodes.filter(e => e.status !== 'unavailable');
+        const available = s.episodes.filter(e => !unreachable(e));
         const picked = available.filter(e => wholeShow || state.selection.has(selectionKey('episode', e.id)));
         const seasonBox = el('input', { type: 'checkbox', disabled: wholeShow || !available.length });
         seasonBox.checked = available.length > 0 && picked.length === available.length;
@@ -310,7 +330,7 @@ function renderSeasons(seasons) {
                 el('span', { textContent: s.season === 0 ? 'Specials' : `Season ${s.season}` }),
                 el('span', { className: 'muted', textContent: `${s.episodes.filter(e => e.status === 'done').length}/${available.length} done` })));
         for (const e of s.episodes) {
-            const unavailable = e.status === 'unavailable';
+            const unavailable = unreachable(e);
             const box = el('input', { type: 'checkbox', disabled: wholeShow || unavailable });
             box.checked = !unavailable && (wholeShow || state.selection.has(selectionKey('episode', e.id)));
             box.onchange = () => { toggleSelection(episodeItem(show, s, e), box.checked); renderSeasons(seasons); };
@@ -318,7 +338,8 @@ function renderSeasons(seasons) {
                 box,
                 el('span', { textContent: `E${String(e.number).padStart(2, '0')}` }),
                 el('span', { className: 'ep-name', textContent: e.name }),
-                el('span', { className: `badge pill ${e.status}`, textContent: STATUS_LABEL[e.status] || e.status })));
+                el('span', { className: `badge pill ${e.status}`, textContent: STATUS_LABEL[e.status] || e.status,
+                             title: e.status === 'unmapped' ? unmappedHint(e.name, e.server_path) : '' })));
         }
         box.append(section);
     }
@@ -374,7 +395,10 @@ async function refreshJobs() {
         list = (await api('/jobs')).jobs;
     } catch { /* keep polling */ }
     const active = list.filter(j => j.status === 'queued' || j.status === 'running').length;
-    if (state.activeJobs && active < state.activeJobs) loadLibrary();   // a job finished: badges changed
+    if (state.activeJobs && active < state.activeJobs) {     // a job finished: badges changed
+        loadLibrary();
+        if ($('show-dialog').open && state.show) reloadShowEpisodes();
+    }
     state.activeJobs = active;
     renderJobs(list, active);
     jobsTimer = setTimeout(refreshJobs, active ? 2000 : 10000);
@@ -391,9 +415,9 @@ function renderJobs(list, active) {
         return;
     }
     for (const j of list) {
-        const what = j.op === 'translate' ? `→ ${j.target_lang} with ${j.model}`
-                   : j.op === 'shift' ? `${j.target_lang} shift ${j.params.offset_ms > 0 ? '+' : ''}${j.params.offset_ms} ms`
-                   : `${j.target_lang} sync (${j.params.priority})`;
+        const what = j.op === 'translate' ? `to ${j.target_lang} with ${j.model}`
+                   : j.op === 'shift' ? `${j.target_lang} by ${j.params.offset_ms > 0 ? '+' : ''}${j.params.offset_ms} ms`
+                   : `${j.target_lang} against ${{ auto: 'the best reference', srt: 'the English subtitle', audio: 'the audio' }[j.params.priority] || j.params.priority}`;
         const li = el('li', { className: 'job' },
             el('div', {}, el('span', { className: 'job-title', textContent: j.title || j.video_path }),
                 el('span', { className: 'job-meta', textContent: `  ${OPS[j.op]?.label || j.op} ${what}` })),
@@ -435,9 +459,7 @@ async function init() {
     const names = state.config.servers.map(s => s.name);
     const savedServer = prefs.get('server', '');
     state.server = names.includes(savedServer) ? savedServer : names[0] || null;
-    const codes = state.config.languages.map(l => l.code);
-    const savedLang = prefs.get('lang', state.config.default_lang);
-    state.lang = codes.includes(savedLang) ? savedLang : state.config.default_lang;
+    state.lang = state.config.default_lang;
 
     renderServerTabs();
     renderLanguages();
@@ -452,6 +474,7 @@ async function init() {
     $('search').oninput = e => { state.query = e.target.value; renderGrid(); };
     $('run').onclick = runSelected;
     $('clear-selection').onclick = clearSelection;
+    $('reload').onclick = () => loadLibrary(true);
     $('show-apply').onclick = () => $('show-dialog').close();
     $('jobs-toggle').onclick = () => $('jobs-panel').classList.toggle('collapsed');
     $('jobs-clear').onclick = async () => { await api('/jobs/finished', { method: 'DELETE' }); refreshJobs(); };
