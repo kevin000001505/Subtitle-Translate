@@ -1,5 +1,4 @@
 .env
-CLAUDE.md
 AGENTS.md
 queue_data
 *.ipynb
