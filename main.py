@@ -426,33 +426,65 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
         {batch_text}
         """
 
-        for attempt in range(3):
-            try:
-                if TRANSLATOR_BACKEND == "gemini" and client is not None:
+        gemini_fallback_used = False
+        result_text = None
+
+        # Primary translator (TranslateGemma or Gemini based on config)
+        if TRANSLATOR_BACKEND == "gemini" and client is not None:
+            for attempt in range(3):
+                try:
                     response = await client.aio.models.generate_content(
-                        model=GEMINI_MODEL,
-                        contents=prompt
+                        model=GEMINI_MODEL, contents=prompt
                     )
                     log_api_call()
                     result_text = response.text
-                else:
+                    break
+                except Exception as e:
+                    wait_time = (attempt + 1) * 2
+                    if attempt == 2:
+                        logger.error(f"Failed chunk {index}: {e}")
+                        return None
+                    await asyncio.sleep(wait_time)
+        else:
+            for attempt in range(3):
+                try:
                     result_text = await translate_gemma_client.translate(batch_text, context_text)
                     if result_text is None:
                         raise Exception("TranslateGemma returned None")
+                    break
+                except Exception as e:
+                    wait_time = (attempt + 1) * 2
+                    if attempt == 2:
+                        if client is not None:
+                            gemini_fallback_used = True
+                            logger.warning(f"TranslateGemma failed for chunk {index}, falling back to Gemini: {e}")
+                            for g_attempt in range(3):
+                                try:
+                                    response = await client.aio.models.generate_content(
+                                        model=GEMINI_MODEL, contents=prompt
+                                    )
+                                    log_api_call()
+                                    result_text = response.text
+                                    break
+                                except Exception as g_e:
+                                    g_wait = (g_attempt + 1) * 2
+                                    if g_attempt == 2:
+                                        logger.error(f"Failed chunk {index} (gemini fallback): {g_e}")
+                                        return None
+                                    await asyncio.sleep(g_wait)
+                            break
+                        logger.error(f"Failed chunk {index}: {e}")
+                        return None
+                    await asyncio.sleep(wait_time)
 
-                progress_counter['completed'] += 1
-                current = progress_counter['completed']
-                if current % 10 == 0 or current == total_chunks:
-                    bar = get_progress_bar(current, total_chunks)
-                    logger.info(f"PROGRESS: {bar} ({current}/{total_chunks})")
+        if result_text:
+            progress_counter['completed'] += 1
+            current = progress_counter['completed']
+            if current % 10 == 0 or current == total_chunks:
+                bar = get_progress_bar(current, total_chunks)
+                logger.info(f"PROGRESS: {bar} ({current}/{total_chunks})")
 
-                return result_text
-            except Exception as e:
-                wait_time = (attempt + 1) * 2
-                if attempt == 2:
-                    logger.error(f"Failed chunk {index}: {e}")
-                    return None
-                await asyncio.sleep(wait_time)
+        return result_text
 
 async def translate_single_subtitle(en_sub_path: str) -> bool:
     """

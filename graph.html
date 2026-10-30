@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-subtitle-service — architecture graph</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@200;300;400;600;700;800;900&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #0a0b0f;
+    --bg2: #111318;
+    --surface: #161820;
+    --surface2: #1c1f2a;
+    --border: #2a2d3a;
+    --text: #e2e4ea;
+    --text2: #8b8fa3;
+    --accent: #00e5a0;
+    --accent2: #00c4f1;
+    --accent3: #a855f7;
+    --accent4: #f59e0b;
+    --accent5: #ef4444;
+    --glow: rgba(0, 229, 160, 0.15);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 60% at 20% 20%, rgba(0,229,160,0.04), transparent),
+      radial-gradient(ellipse 60% 50% at 80% 80%, rgba(168,85,247,0.04), transparent),
+      radial-gradient(ellipse 50% 40% at 50% 50%, rgba(0,196,241,0.02), transparent);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .noise {
+    position: fixed;
+    inset: 0;
+    opacity: 0.03;
+    pointer-events: none;
+    z-index: 1;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchImages='1'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 256px 256px;
+  }
+
+  .canvas-container {
+    position: relative;
+    width: 100%;
+    min-height: 100vh;
+    z-index: 2;
+  }
+
+  canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    padding: 24px 32px;
+    background: linear-gradient(180deg, rgba(10,11,15,0.95) 0%, rgba(10,11,15,0) 100%);
+    pointer-events: none;
+  }
+
+  .header h1 {
+    font-family: 'Outfit', sans-serif;
+    font-weight: 800;
+    font-size: 1.4rem;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+
+  .header h1 span {
+    color: var(--accent);
+  }
+
+  .header p {
+    font-size: 0.8rem;
+    color: var(--text2);
+    margin-top: 4px;
+    font-weight: 300;
+  }
+
+  .legend {
+    position: fixed;
+    bottom: 24px;
+    left: 24px;
+    z-index: 10;
+    background: rgba(22,24,32,0.9);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    font-size: 0.75rem;
+    pointer-events: auto;
+  }
+
+  .legend-title {
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600;
+    font-size: 0.85rem;
+    margin-bottom: 10px;
+    color: var(--text);
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    color: var(--text2);
+  }
+
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .controls {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 10;
+    display: flex;
+    gap: 8px;
+  }
+
+  .controls button {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: rgba(22,24,32,0.9);
+    backdrop-filter: blur(12px);
+    color: var(--text2);
+    font-size: 1.1rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+  }
+
+  .controls button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(0,229,160,0.05);
+  }
+
+  .tooltip {
+    position: fixed;
+    z-index: 100;
+    background: rgba(22,24,32,0.95);
+    backdrop-filter: blur(16px);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 0.75rem;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    max-width: 280px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+
+  .tooltip.visible { opacity: 1; }
+  .tooltip h3 {
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600;
+    font-size: 0.85rem;
+    margin-bottom: 6px;
+    color: var(--accent);
+  }
+  .tooltip p { color: var(--text2); line-height: 1.5; }
+  .tooltip .tag {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    margin-top: 6px;
+    margin-right: 4px;
+    background: rgba(0,229,160,0.1);
+    color: var(--accent);
+    border: 1px solid rgba(0,229,160,0.2);
+  }
+</style>
+</head>
+<body>
+<div class="noise"></div>
+
+<div class="header">
+  <h1>ai-subtitle-service <span>◉</span></h1>
+  <p>architecture graph — click nodes to explore</p>
+</div>
+
+<div class="canvas-container">
+  <canvas id="graph"></canvas>
+</div>
+
+<div class="legend">
+  <div class="legend-title">Node Types</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div> Core Service</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent2)"></div> API Layer</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent3)"></div> Data / Storage</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent4)"></div> External Service</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent5)"></div> Frontend</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#8b8fa3"></div> Utility / Config</div>
+</div>
+
+<div class="controls">
+  <button onclick="resetView()" title="Reset view">⟲</button>
+  <button onclick="zoomIn()" title="Zoom in">+</button>
+  <button onclick="zoomOut()" title="Zoom out">−</button>
+</div>
+
+<div class="tooltip" id="tooltip">
+  <h3 id="tt-title"></h3>
+  <p id="tt-desc"></p>
+  <div id="tt-tags"></div>
+</div>
+
+<script>
+const canvas = document.getElementById('graph');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+
+let W, H, dpr;
+let transform = { x: 0, y: 0, k: 1 };
+let dragging = false, dragStart = { x: 0, y: 0 }, trStart = { x: 0, y: 0 };
+let hoveredNode = null, selectedNode = null;
+let animFrame;
+let time = 0;
+
+const nodes = [
+  // Core
+  { id: 'main', label: 'main.py', desc: 'FastAPI service — translation, shift, sync. Orchestrates the full pipeline.', layer: 0, color: '#00e5a0', tags: ['780 lines', 'FastAPI', 'async'] },
+  { id: 'translate_gemma', label: 'translate_gemma.py', desc: 'Local llama.cpp server client for translation fallback.', layer: 0, color: '#00e5a0', tags: ['local inference'] },
+  { id: 'subtitle_fetch', label: 'subtitle_fetch.py', desc: 'Subtitle extraction helpers — MKV/MP4 probe & extract.', layer: 0, color: '#00e5a0', tags: ['ffmpeg', 'ffprobe'] },
+
+  // API
+  { id: 'translate_ep', label: 'POST /translate', desc: 'Async translation job — splits subtitles, sends to Gemini/TranslateGemma.', layer: 1, color: '#00c4f1', tags: ['background task', 'rate limited'] },
+  { id: 'shift_ep', label: 'POST /shift', desc: 'Timing offset — nudges all .zh-tw.srt files by N ms.', layer: 1, color: '#00c4f1', tags: ['pysubs2'] },
+  { id: 'sync_ep', label: 'POST /sync', desc: 'Async ffsubsync job with SSE progress streaming.', layer: 1, color: '#00c4f1', tags: ['SSE', 'ffsubsync'] },
+  { id: 'sync_progress', label: 'GET /sync/progress/:id', desc: 'SSE endpoint — streams job state every second.', layer: 1, color: '#00c4f1', tags: ['StreamingResponse'] },
+  { id: 'history_ep', label: 'GET /history', desc: 'Returns recent operations from the history table.', layer: 1, color: '#00c4f1', tags: ['SQLite'] },
+  { id: 'list_ep', label: 'GET /list-directory', desc: 'Lists directory contents for the browser UI.', layer: 1, color: '#00c4f1', tags: ['file browser'] },
+
+  // Data
+  { id: 'queue_db', label: 'queue.db', desc: 'SQLite — tracks API usage logs, job queue, and operation history.', layer: 2, color: '#a855f7', tags: ['usage_log', 'job_queue', 'history'] },
+  { id: 'media', label: '/media', desc: 'Mounted video directory — contains .mkv, .mp4, .srt files.', layer: 2, color: '#a855f7', tags: ['docker volume'] },
+
+  // External
+  { id: 'gemini', label: 'Gemini API', desc: 'Google Gemini AI — primary translation engine.', layer: 3, color: '#f59e0b', tags: ['gemini-2.5-flash-lite', '9500/day limit'] },
+  { id: 'llama', label: 'llama.cpp server', desc: 'Local LLM server — fallback translation backend.', layer: 3, color: '#f59e0b', tags: ['TRANSLATOR_BACKEND'] },
+  { id: 'ffmpeg', label: 'ffmpeg / ffprobe', desc: 'Video/audio probe and subtitle extraction from containers.', layer: 3, color: '#f59e0b', tags: ['substream extract'] },
+  { id: 'ffsubsync', label: 'ffsubsync', desc: 'Auto-aligns subtitle timing with video audio track.', layer: 3, color: '#f59e0b', tags: ['srt mode', 'audio mode'] },
+
+  // Frontend
+  { id: 'frontend', label: 'frontend/', desc: 'Three-tab UI — translate, shift, sync. File browser with drag-select.', layer: 4, color: '#ef4444', tags: ['index.html', 'app.js', 'styles.css'] },
+
+  // Config
+  { id: 'docker', label: 'Dockerfile', desc: 'Multi-stage build — Python 3.12 + ffmpeg + ffsubsync.', layer: 5, color: '#8b8fa3', tags: ['multi-stage'] },
+  { id: 'compose', label: 'docker-compose.yml', desc: 'Orchestrates backend (8000) + frontend (8080) services.', layer: 5, color: '#8b8fa3', tags: ['nginx', 'uvicorn'] },
+  { id: 'env', label: '.env', desc: 'GEMINI_API_KEY, GEMINI_MODEL, TRANSLATOR_BACKEND, etc.', layer: 5, color: '#8b8fa3', tags: ['env vars'] },
+];
+
+const edges = [
+  // Main service connections
+  { from: 'main', to: 'translate_gemma', label: 'imports' },
+  { from: 'main', to: 'subtitle_fetch', label: 'imports' },
+  { from: 'main', to: 'queue_db', label: 'reads/writes' },
+  { from: 'main', to: 'media', label: 'processes' },
+
+  // API endpoints connected to main
+  { from: 'translate_ep', to: 'main', label: 'dispatches' },
+  { from: 'shift_ep', to: 'main', label: 'dispatches' },
+  { from: 'sync_ep', to: 'main', label: 'dispatches' },
+  { from: 'sync_progress', to: 'main', label: 'polls state' },
+  { from: 'history_ep', to: 'queue_db', label: 'queries' },
+  { from: 'list_ep', to: 'main', label: 'utility' },
+
+  // External services
+  { from: 'translate_gemma', to: 'gemini', label: 'calls' },
+  { from: 'translate_gemma', to: 'llama', label: 'calls' },
+  { from: 'subtitle_fetch', to: 'ffmpeg', label: 'runs' },
+  { from: 'sync_ep', to: 'ffsubsync', label: 'runs' },
+
+  // Frontend
+  { from: 'frontend', to: 'translate_ep', label: 'fetches' },
+  { from: 'frontend', to: 'shift_ep', label: 'fetches' },
+  { from: 'frontend', to: 'sync_ep', label: 'fetches' },
+  { from: 'frontend', to: 'sync_progress', label: 'SSE' },
+  { from: 'frontend', to: 'list_ep', label: 'fetches' },
+  { from: 'frontend', to: 'history_ep', label: 'fetches' },
+
+  // Config
+  { from: 'docker', to: 'main', label: 'builds image' },
+  { from: 'compose', to: 'docker', label: 'uses' },
+  { from: 'env', to: 'main', label: 'configures' },
+  { from: 'env', to: 'compose', label: 'configures' },
+];
+
+// Force-directed layout
+const nodeMap = {};
+nodes.forEach(n => {
+  n.x = (Math.random() - 0.5) * 400;
+  n.y = (Math.random() - 0.5) * 300;
+  n.vx = 0;
+  n.vy = 0;
+  n.radius = 28 + n.tags.length * 4;
+  nodeMap[n.id] = n;
+});
+
+const layerOrder = {};
+nodes.forEach((n, i) => { layerOrder[n.id] = i; });
+
+function simulate() {
+  const alpha = 0.3;
+  const centerX = 0, centerY = 0;
+
+  // Layer attraction (y-axis grouping)
+  nodes.forEach(n => {
+    const targetY = -n.layer * 140;
+    n.vy += (targetY - n.y) * 0.01;
+  });
+
+  // Edge forces
+  edges.forEach(e => {
+    const a = nodeMap[e.from];
+    const b = nodeMap[e.to];
+    if (!a || !b) return;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    const idealDist = 180;
+    const force = (dist - idealDist) * 0.01 * alpha;
+    const fx = (dx / dist) * force;
+    const fy = (dy / dist) * force;
+    a.vx += fx; a.vy += fy;
+    b.vx -= fx; b.vy -= fy;
+  });
+
+  // Node repulsion
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      if (dist < 120) {
+        const force = (120 - dist) * 0.05;
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+        a.vx -= fx; a.vy -= fy;
+        b.vx += fx; b.vy += fy;
+      }
+    }
+  }
+
+  // Center gravity
+  nodes.forEach(n => {
+    n.vx -= n.x * 0.001;
+    n.vy -= n.y * 0.0005;
+  });
+
+  // Apply velocity
+  nodes.forEach(n => {
+    n.vx *= 0.85;
+    n.vy *= 0.85;
+    n.x += n.vx;
+    n.y += n.vy;
+  });
+}
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+
+function screenX(wx) { return W / 2 + (wx - transform.x) * transform.k; }
+function screenY(wy) { return H / 2 + (wy - transform.y) * transform.k; }
+function worldX(sx) { return (sx - W / 2) / transform.k + transform.x; }
+function worldY(sy) { return (sy - H / 2) / transform.k + transform.y; }
+
+function drawEdge(e, t) {
+  const a = nodeMap[e.from];
+  const b = nodeMap[e.to];
+  if (!a || !b) return;
+
+  const ax = screenX(a.x), ay = screenY(a.y);
+  const bx = screenX(b.x), by = screenY(b.y);
+
+  const dx = bx - ax, dy = by - ay;
+  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+  const nx = dx / dist, ny = dy / dist;
+
+  const rA = a.radius * transform.k;
+  const rB = b.radius * transform.k;
+
+  const sx = ax + nx * rA;
+  const sy = ay + ny * rA;
+  const ex = bx - nx * rB;
+  const ey = by - ny * rB;
+
+  // Animated dash
+  const dashLen = 8 * transform.k;
+  const dashGap = 12 * transform.k;
+  const offset = -t * 40 * transform.k;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.setLineDash([dashLen, dashGap]);
+  ctx.lineDashOffset = offset;
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(ex, ey);
+  ctx.strokeStyle = 'rgba(42,45,58,0.5)';
+  ctx.lineWidth = 1.5 * transform.k;
+  ctx.stroke();
+  ctx.restore();
+
+  // Arrow
+  const arrowSize = 8 * transform.k;
+  const angle = Math.atan2(dy, dx);
+  ctx.beginPath();
+  ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - arrowSize * Math.cos(angle - 0.3), ey - arrowSize * Math.sin(angle - 0.3));
+  ctx.lineTo(ex - arrowSize * Math.cos(angle + 0.3), ey - arrowSize * Math.sin(angle + 0.3));
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(42,45,58,0.6)';
+  ctx.fill();
+
+  // Edge label
+  if (transform.k > 0.7) {
+    const mx = (sx + ex) / 2;
+    const my = (sy + ey) / 2;
+    ctx.save();
+    ctx.font = `${9 * transform.k}px 'IBM Plex Mono', monospace`;
+    ctx.fillStyle = 'rgba(139,143,163,0.5)';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(e.label, mx, my - 8 * transform.k);
+    ctx.restore();
+  }
+}
+
+function drawNode(n, t) {
+  const cx = screenX(n.x);
+  const cy = screenY(n.y);
+  const r = n.radius * transform.k;
+
+  const isHovered = hoveredNode === n;
+  const isSelected = selectedNode === n;
+  const scale = isHovered ? 1.1 : 1;
+  const currentR = r * scale;
+
+  // Glow
+  if (isHovered || isSelected) {
+    const glowR = currentR * 2.5;
+    const glow = ctx.createRadialGradient(cx, cy, currentR * 0.5, cx, cy, glowR);
+    glow.addColorStop(0, n.color + '30');
+    glow.addColorStop(1, n.color + '00');
+    ctx.beginPath();
+    ctx.arc(cx, cy, glowR, 0, Math.PI * 2);
+    ctx.fillStyle = glow;
+    ctx.fill();
+  }
+
+  // Outer ring
+  ctx.beginPath();
+  ctx.arc(cx, cy, currentR + 2 * transform.k, 0, Math.PI * 2);
+  ctx.strokeStyle = n.color + '20';
+  ctx.lineWidth = 2 * transform.k;
+  ctx.stroke();
+
+  // Main circle
+  const grad = ctx.createRadialGradient(cx - currentR * 0.3, cy - currentR * 0.3, 0, cx, cy, currentR);
+  grad.addColorStop(0, n.color + '25');
+  grad.addColorStop(1, n.color + '10');
+  ctx.beginPath();
+  ctx.arc(cx, cy, currentR, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Border
+  ctx.beginPath();
+  ctx.arc(cx, cy, currentR, 0, Math.PI * 2);
+  ctx.strokeStyle = n.color + (isHovered || isSelected ? '80' : '40');
+  ctx.lineWidth = (isSelected ? 2.5 : 1.5) * transform.k;
+  ctx.stroke();
+
+  // Pulsing ring for main node
+  if (n.id === 'main') {
+    const pulse = Math.sin(t * 2) * 0.5 + 0.5;
+    const pulseR = currentR + (8 + pulse * 12) * transform.k;
+    ctx.beginPath();
+    ctx.arc(cx, cy, pulseR, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(0,229,160,${0.15 * pulse})`;
+    ctx.lineWidth = 1.5 * transform.k;
+    ctx.stroke();
+  }
+
+  // Label
+  ctx.save();
+  ctx.font = `${(isHovered ? 600 : 500) * 1} ${11 * transform.k}px 'IBM Plex Mono', monospace`;
+  ctx.fillStyle = isHovered ? '#ffffff' : n.color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(n.label, cx, cy);
+  ctx.restore();
+
+  // Tags below
+  if (isHovered && n.tags.length > 0 && transform.k > 0.5) {
+    const tagY = cy + currentR + 16 * transform.k;
+    ctx.save();
+    ctx.font = `${9 * transform.k}px 'IBM Plex Mono', monospace`;
+    ctx.textAlign = 'center';
+    n.tags.forEach((tag, i) => {
+      const tx = cx + (i - (n.tags.length - 1) / 2) * (70 * transform.k);
+      ctx.fillStyle = n.color + '40';
+      ctx.beginPath();
+      const tw = ctx.measureText(tag).width;
+      const tw2 = Math.max(tw, 30 * transform.k);
+      const boxW = tw2 + 8 * transform.k;
+      const boxH = 16 * transform.k;
+      const bx = tx - boxW / 2;
+      const by = tagY + i * (boxH + 4 * transform.k);
+      roundRect(ctx, bx, by, boxW, boxH, 4 * transform.k);
+      ctx.fill();
+      ctx.fillStyle = n.color + 'aa';
+      ctx.fillText(tag, tx, by + boxH / 2);
+    });
+    ctx.restore();
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function render(t) {
+  time = t / 1000;
+  simulate();
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0a0b0f';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.save();
+  ctx.strokeStyle = 'rgba(42,45,58,0.15)';
+  ctx.lineWidth = 1;
+  const gridSize = 60 * transform.k;
+  const offsetX = (-transform.x * transform.k + W / 2) % gridSize;
+  const offsetY = (-transform.y * transform.k + H / 2) % gridSize;
+  for (let x = offsetX; x < W; x += gridSize) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, H);
+    ctx.stroke();
+  }
+  for (let y = offsetY; y < H; y += gridSize) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // Draw edges
+  edges.forEach(e => drawEdge(e, time));
+
+  // Draw nodes
+  nodes.forEach(n => drawNode(n, time));
+
+  animFrame = requestAnimationFrame(render);
+}
+
+// Interaction
+function getNodeAt(sx, sy) {
+  const wx = worldX(sx);
+  const wy = worldY(sy);
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    const dx = wx - n.x;
+    const dy = wy - n.y;
+    if (Math.sqrt(dx * dx + dy * dy) < n.radius + 5) return n;
+  }
+  return null;
+}
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  if (dragging) {
+    transform.x = trStart.x - (mx - dragStart.x) / transform.k;
+    transform.y = trStart.y - (my - dragStart.y) / transform.k;
+    return;
+  }
+
+  const node = getNodeAt(mx, my);
+  hoveredNode = node;
+  canvas.style.cursor = node ? 'pointer' : 'grab';
+
+  if (node) {
+    tooltip.classList.add('visible');
+    document.getElementById('tt-title').textContent = node.label;
+    document.getElementById('tt-desc').textContent = node.desc;
+    const tagsEl = document.getElementById('tt-tags');
+    tagsEl.innerHTML = node.tags.map(t => `<span class="tag">${t}</span>`).join('');
+
+    let tx = e.clientX + 16;
+    let ty = e.clientY - 10;
+    if (tx + 280 > W) tx = e.clientX - 280;
+    if (ty + 100 > H) ty = e.clientY - 100;
+    tooltip.style.left = tx + 'px';
+    tooltip.style.top = ty + 'px';
+  } else {
+    tooltip.classList.remove('visible');
+  }
+});
+
+canvas.addEventListener('mousedown', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  const node = getNodeAt(mx, my);
+  if (node) {
+    selectedNode = node;
+    return;
+  }
+
+  dragging = true;
+  dragStart = { x: mx, y: my };
+  trStart = { x: transform.x, y: transform.y };
+  canvas.style.cursor = 'grabbing';
+});
+
+canvas.addEventListener('mouseup', () => {
+  dragging = false;
+  canvas.style.cursor = hoveredNode ? 'pointer' : 'grab';
+});
+
+canvas.addEventListener('mouseleave', () => {
+  dragging = false;
+  hoveredNode = null;
+  tooltip.classList.remove('visible');
+});
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const delta = e.deltaY > 0 ? 0.9 : 1.1;
+  const newK = Math.max(0.3, Math.min(3, transform.k * delta));
+
+  // Zoom toward cursor
+  const wx = worldX(e.clientX - canvas.getBoundingClientRect().left);
+  const wy = worldY(e.clientY - canvas.getBoundingClientRect().top);
+  transform.x += (wx - worldX(e.clientX - canvas.getBoundingClientRect().left)) * (1 - delta);
+  transform.y += (wy - worldY(e.clientY - canvas.getBoundingClientRect().top)) * (1 - delta);
+  transform.k = newK;
+}, { passive: false });
+
+function resetView() {
+  transform = { x: 0, y: 0, k: 1 };
+  selectedNode = null;
+}
+
+function zoomIn() { transform.k = Math.min(3, transform.k * 1.2); }
+function zoomOut() { transform.k = Math.max(0.3, transform.k * 0.8); }
+
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

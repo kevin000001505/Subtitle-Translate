@@ -14,7 +14,7 @@
    ============================================================ */
 
 // 1. CONFIG ────────────────────────────────────────────────────
-const API_BASE   = 'http://localhost:8000';
+const API_BASE   = '/api';
 const MEDIA_ROOT = '/media';
 const MEDIA_RE   = /\.(srt|mkv|mp4|avi|mov|wav|mp3|m4a|flac|aac)$/i;
 const VIDEO_RE   = /\.(mkv|mp4|avi|mov)$/i;
