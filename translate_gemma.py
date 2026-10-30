@@ -4,6 +4,8 @@ import asyncio
 import logging
 import requests
 
+from subtitle_files import SOURCE_LANG
+
 logger = logging.getLogger("SubtitleAPI")
 
 TRANSLATE_GEMMA_MODEL = os.getenv("TRANSLATE_GEMMA_MODEL", "translatemgemma")
@@ -48,7 +50,7 @@ class TranslateGemmaClient:
                     "content": [
                         {
                             "type": "text",
-                            "source_lang_code": "en",
+                            "source_lang_code": SOURCE_LANG,
                             "target_lang_code": target_lang,
                             "text": prompt,
                         }
