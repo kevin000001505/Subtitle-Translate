@@ -273,3 +273,13 @@ def test_a_language_code_in_other_letter_case_matches_the_existing_translation(m
 
     assert llama.requests == []
     assert sorted(p.name for p in media.iterdir()) == ["Movie.en.srt", "Movie.zh-TW.srt"]
+
+
+def test_a_chosen_gemini_translator_without_an_api_key_writes_nothing(media, llama):
+    assert main.client is None
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media, target_lang="ja",
+                      translator=main.Translator(backend="gemini", model="gemini-2.5-pro"))
+
+    assert not (media / "Movie.ja.srt").exists()

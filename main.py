@@ -509,6 +509,9 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     Returns True if successful, False otherwise.
     """
     translator = translator or default_translator()
+    if translator.backend == "gemini" and client is None:
+        logger.error(f"Cannot translate {en_sub_path} with {translator.model}: GEMINI_API_KEY is not set")
+        return False
     logger.info(f"START: Processing {en_sub_path}")
 
     try:
