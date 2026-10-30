@@ -1,7 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 from typing import Annotated
 import uvicorn
 import os
@@ -17,7 +17,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from translate_gemma import TRANSLATE_GEMMA_MODEL, TranslateGemmaClient
-from subtitle_files import DEFAULT_TARGET_LANG, output_subtitle_path, sidecar_subtitle_path, subtitle_suffix
+from subtitle_files import DEFAULT_TARGET_LANG, canonical_lang, output_subtitle_path, sidecar_subtitle_path, subtitle_suffix
 
 try:
     from google import genai
@@ -77,8 +77,10 @@ sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 # A BCP-47 style code such as "ja" or "zh-TW". It becomes part of the
 # subtitle file name, so anything else (spaces, slashes, dots) is refused,
-# and it is capped at the 35 characters RFC 5646 asks tags to fit in.
-LangCode = Annotated[str, Field(pattern=r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$", max_length=35)]
+# and it is capped at the 35 characters RFC 5646 asks tags to fit in. Casing
+# is normalised so "zh-tw" finds an existing "zh-TW" subtitle.
+LangCode = Annotated[str, Field(pattern=r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$", max_length=35),
+                     AfterValidator(canonical_lang)]
 
 class SubtitleRequest(BaseModel):
     path: str

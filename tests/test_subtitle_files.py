@@ -1,6 +1,6 @@
 import pytest
 
-from subtitle_files import output_subtitle_path, sidecar_subtitle_path
+from subtitle_files import canonical_lang, output_subtitle_path, sidecar_subtitle_path
 
 
 @pytest.mark.parametrize("lang", ["zh-TW", "ja"])
@@ -20,3 +20,15 @@ def test_the_translation_of_a_non_srt_subtitle_keeps_its_full_name():
 @pytest.mark.parametrize("lang", ["zh-TW", "ja"])
 def test_a_videos_subtitle_is_named_after_the_video(lang):
     assert sidecar_subtitle_path("/media/S/S01E01.mkv", lang) == f"/media/S/S01E01.{lang}.srt"
+
+
+@pytest.mark.parametrize("code, canonical", [
+    ("zh-tw", "zh-TW"),
+    ("ZH-HANT-tw", "zh-Hant-TW"),
+    ("ES-419", "es-419"),
+    ("JA", "ja"),
+    ("ZH-YUE-hk", "zh-yue-HK"),
+    ("EN-1A2B", "en-1a2b"),
+])
+def test_language_codes_get_bcp47_casing(code, canonical):
+    assert canonical_lang(code) == canonical

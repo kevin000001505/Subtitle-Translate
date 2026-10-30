@@ -3,6 +3,21 @@ import os
 DEFAULT_TARGET_LANG = "zh-TW"
 
 
+def canonical_lang(code: str) -> str:
+    """BCP-47 casing, so "zh-tw" and "ZH-TW" name the same file as "zh-TW":
+    language lower case, 4-letter script title case, 2-letter region upper case."""
+    language, *subtags = code.split("-")
+    cased = [language.lower()]
+    for tag in subtags:
+        if len(tag) == 4 and tag.isalpha():
+            cased.append(tag.title())
+        elif len(tag) == 2 and tag.isalpha():
+            cased.append(tag.upper())
+        else:
+            cased.append(tag.lower())
+    return "-".join(cased)
+
+
 def subtitle_suffix(lang: str) -> str:
     """The `.<lang>.srt` ending that marks a subtitle's language."""
     return f".{lang}.srt"

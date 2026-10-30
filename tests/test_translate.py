@@ -263,3 +263,13 @@ def test_a_local_translator_without_fallback_never_calls_gemini(media, llama, ge
 
     assert gemini.prompts == []
     assert [r["json"]["model"] for r in llama.requests] == ["qwen3"] * 9
+
+
+def test_a_language_code_in_other_letter_case_matches_the_existing_translation(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.zh-TW.srt").write_text("keep me")
+
+    translate(media, target_lang="zh-tw")
+
+    assert llama.requests == []
+    assert sorted(p.name for p in media.iterdir()) == ["Movie.en.srt", "Movie.zh-TW.srt"]
