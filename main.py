@@ -658,14 +658,17 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
 
 # ================= SCHEDULER & APP =================
 
+async def run_next_queued_job():
+    used = get_calls_last_24h()
+    if (DAILY_LIMIT - used) > 100:
+        next_file = pop_from_queue()
+        if next_file:
+            logger.info(f"MONITOR: Starting queued job: {next_file}")
+            await process_movie(next_file)
+
 async def queue_monitor():
     while True:
-        used = get_calls_last_24h()
-        if (DAILY_LIMIT - used) > 100:
-            next_file = pop_from_queue()
-            if next_file:
-                logger.info(f"MONITOR: Starting queued job: {next_file}")
-                await process_movie(next_file)
+        await run_next_queued_job()
         await asyncio.sleep(3600)
 
 @asynccontextmanager
