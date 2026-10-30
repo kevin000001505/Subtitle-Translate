@@ -243,3 +243,23 @@ def test_the_translate_endpoint_rejects_an_over_long_language_code(media, llama)
 
     assert response.status_code == 422
     assert llama.requests == []
+
+
+def test_gemini_is_the_default_translator_when_configured_and_keyed(media, llama, gemini, monkeypatch):
+    monkeypatch.setattr(main, "TRANSLATOR_BACKEND", "gemini")
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert gemini.models_used == ["gemini-2.5-flash-lite"]
+    assert llama.requests == []
+
+
+def test_a_local_translator_without_fallback_never_calls_gemini(media, llama, gemini):
+    llama.status_code = 500
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media, translator=main.Translator(backend="llama-swap", model="qwen3"))
+
+    assert gemini.prompts == []
+    assert [r["json"]["model"] for r in llama.requests] == ["qwen3"] * 9
