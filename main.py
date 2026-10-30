@@ -820,30 +820,6 @@ def history_endpoint(limit: int = 200):
     return {"history": get_history(limit)}
 
 
-@app.get("/list-directory")
-def list_directory_endpoint(path: str):
-    """
-    List contents of a directory for the browser UI.
-    
-    Returns JSON with items array containing {name, type, path} objects.
-    type is either "folder" or "file".
-    """
-    if not os.path.exists(path) or not os.path.isdir(path):
-        return {"items": [], "error": "Path not found or not a directory"}
-    
-    items = []
-    for entry in sorted(os.listdir(path)):
-        full_path = os.path.join(path, entry)
-        item_type = "folder" if os.path.isdir(full_path) else "file"
-        items.append({
-            "name": entry,
-            "type": item_type,
-            "path": full_path
-        })
-    
-    return {"items": items}
-
-
 # ================= LIBRARY JOBS =================
 
 # Media servers configured in .env (JELLYFIN_URL / PLEX_URL), in switcher order.

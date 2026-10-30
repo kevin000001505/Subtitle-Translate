@@ -3,111 +3,98 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Subtitle Service</title>
+    <title>Subtitle Library</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<div class="container">
 
-    <h1>AI Subtitle Service</h1>
-    <p class="subtitle">Translate, shift, and sync subtitles for your media files</p>
+<header class="topbar">
+    <div class="brand">Subtitle Library</div>
+    <nav class="server-tabs hidden" id="server-tabs" aria-label="Media server"></nav>
+    <input type="search" id="search" class="search" placeholder="Search titles…" aria-label="Search titles">
+    <div class="kind-filter" id="kind-filter" role="group" aria-label="Show">
+        <button class="chip active" data-kind="all">All</button>
+        <button class="chip" data-kind="movie">Movies</button>
+        <button class="chip" data-kind="show">Shows</button>
+    </div>
+</header>
 
-    <!-- Operation selector -->
-    <div class="op-selector" id="op-selector">
-        <div class="op-card active" data-op="translate">
-            <div class="op-icon">🌐</div>
-            <div class="op-title">Translate</div>
-            <div class="op-desc">English → Traditional Chinese<br>powered by Gemini AI</div>
-        </div>
-        <div class="op-card" data-op="shift">
-            <div class="op-icon">⏱️</div>
-            <div class="op-title">Shift Timing</div>
-            <div class="op-desc">Nudge subtitles earlier<br>or later by milliseconds</div>
-        </div>
-        <div class="op-card" data-op="sync">
-            <div class="op-icon">🔄</div>
-            <div class="op-title">Sync &amp; Align</div>
-            <div class="op-desc">Auto-sync subtitles<br>with video audio</div>
-        </div>
+<section class="toolbar" aria-label="Job options">
+    <div class="op-tabs" id="op-tabs" role="tablist">
+        <button class="op active" data-op="translate">Translate</button>
+        <button class="op" data-op="shift">Shift timing</button>
+        <button class="op" data-op="sync">Sync &amp; align</button>
     </div>
 
-    <!-- Folder browser -->
-    <div class="card">
-        <div class="card-title">Browse &amp; Select Folders</div>
-        <div class="breadcrumb" id="breadcrumb"></div>
-        <div id="blocks-area">
-            <div class="blocks-state">Loading…</div>
-        </div>
+    <label class="field">
+        <span>Language</span>
+        <select id="lang"></select>
+    </label>
+
+    <label class="field op-translate">
+        <span>Model</span>
+        <select id="model"></select>
+    </label>
+
+    <label class="field check op-translate">
+        <input type="checkbox" id="overwrite">
+        <span>Overwrite existing</span>
+    </label>
+
+    <label class="field op-shift hidden">
+        <span>Offset (ms)</span>
+        <input type="number" id="offset" value="-500" step="100">
+    </label>
+
+    <label class="field op-sync hidden">
+        <span>Align against</span>
+        <select id="priority">
+            <option value="auto">Auto</option>
+            <option value="srt">English subtitle</option>
+            <option value="audio">Audio</option>
+        </select>
+    </label>
+
+    <div class="run">
+        <span id="selection-count" class="muted">Nothing selected</span>
+        <button id="clear-selection" class="link hidden">Clear</button>
+        <button id="run" class="primary" disabled>Translate</button>
     </div>
+</section>
 
-    <!-- Per-operation settings -->
-    <div class="card">
+<p id="model-note" class="note hidden"></p>
 
-        <div id="translate-settings">
-            <div class="card-title">Translate Subtitles</div>
-            <p style="color:#888;font-size:0.9rem;">
-                Select one or more folders above. Each folder will be scanned for
-                <span class="code-chip">.en.srt</span> files — or English subtitles
-                will be extracted from MKV/MP4 if needed — then translated to Traditional Chinese.
-            </p>
-        </div>
+<main>
+    <div id="library-state" class="state">Loading library…</div>
+    <div id="grid" class="grid"></div>
+</main>
 
-        <div id="shift-settings" class="hidden">
-            <div class="card-title">Timing Offset</div>
-            <div class="form-group">
-                <label class="field-label" for="shift-offset">Milliseconds to shift</label>
-                <input type="number" id="shift-offset" class="num-input" value="-500">
-                <span style="color:#888;margin-left:8px;font-size:0.9rem;">ms</span>
-                <p class="field-hint">
-                    Negative = earlier &nbsp;·&nbsp; Positive = later.
-                    Applied to all <span class="code-chip">.zh-tw.srt</span> files inside each selected folder.
-                </p>
-            </div>
-        </div>
-
-        <div id="sync-settings" class="hidden">
-            <div class="card-title">Alignment Method</div>
-            <div class="priority-list" id="priority-list">
-                <label class="p-option selected">
-                    <input type="radio" name="sync-priority" value="auto" checked>
-                    <div class="p-radio"></div>
-                    <div>
-                        <div class="p-label">🤖 Auto (Default)</div>
-                        <div class="p-hint">Intelligently picks the best method based on available files</div>
-                    </div>
-                </label>
-                <label class="p-option">
-                    <input type="radio" name="sync-priority" value="srt">
-                    <div class="p-radio"></div>
-                    <div>
-                        <div class="p-label">⚡ SRT-Only</div>
-                        <div class="p-hint">Faster — aligns using subtitle metadata only (5–10 min)</div>
-                    </div>
-                </label>
-                <label class="p-option">
-                    <input type="radio" name="sync-priority" value="audio">
-                    <div class="p-radio"></div>
-                    <div>
-                        <div class="p-label">🎤 Audio-Based</div>
-                        <div class="p-hint">More accurate — correlates audio waveform (15–30 min)</div>
-                    </div>
-                </label>
-            </div>
-        </div>
-
+<aside class="jobs" id="jobs-panel" aria-label="Jobs">
+    <div class="jobs-head">
+        <button id="jobs-toggle" class="jobs-title">Jobs <span id="jobs-badge" class="count hidden"></span></button>
+        <button id="jobs-clear" class="link">Clear finished</button>
     </div>
+    <ol id="jobs-list" class="jobs-list"></ol>
+</aside>
 
-    <button class="action-btn" id="action-btn" disabled>
-        Select folders above to continue
-    </button>
-    <div id="status-wrap"></div>
-
-    <div class="card hidden" id="history-card">
-        <div class="card-title">History</div>
-        <div id="history-list"></div>
+<dialog id="show-dialog" class="show-dialog">
+    <form method="dialog" class="show-head">
+        <img id="show-poster" alt="">
+        <div>
+            <h2 id="show-title"></h2>
+            <p id="show-summary" class="muted"></p>
+            <label class="check"><input type="checkbox" id="show-all"> Whole show</label>
+        </div>
+        <button class="close" aria-label="Close">✕</button>
+    </form>
+    <div id="show-seasons" class="seasons"></div>
+    <div class="show-foot">
+        <button id="show-apply" class="primary">Done</button>
     </div>
+</dialog>
 
-</div>
+<div id="toast" class="toast hidden" role="status"></div>
+
 <script src="app.js"></script>
 </body>
 </html>
