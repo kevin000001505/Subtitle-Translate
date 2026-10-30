@@ -15,6 +15,7 @@ import uuid
 import subprocess
 from contextlib import asynccontextmanager
 from translate_gemma import TranslateGemmaClient
+from subtitle_files import DEFAULT_TARGET_LANG, output_subtitle_path, sidecar_subtitle_path
 
 try:
     from google import genai
@@ -22,7 +23,7 @@ except ImportError:
     genai = None
 
 # ================= CONFIGURATION =================
-TARGET_LANG = "zh-TW"
+TARGET_LANG = DEFAULT_TARGET_LANG
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
@@ -109,8 +110,7 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
     # Build work list — only files that have a matching zh-TW.srt
     files = []
     for video_file in video_files:
-        base   = os.path.splitext(video_file)[0]
-        zh_srt = os.path.join(folder_path, f"{base}.zh-TW.srt")
+        zh_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file))
         if os.path.exists(zh_srt):
             files.append({"name": video_file, "status": "pending"})
         else:
@@ -136,7 +136,7 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
 
         base       = os.path.splitext(video_file)[0]
         video_path = os.path.join(folder_path, video_file)
-        zh_srt     = os.path.join(folder_path, f"{base}.zh-TW.srt")
+        zh_srt     = sidecar_subtitle_path(video_path)
         en_srt     = os.path.join(folder_path, f"{base}.en.srt")
 
         use_srt_ref = (priority in ("srt", "auto")) and os.path.exists(en_srt)
@@ -541,14 +541,7 @@ async def translate_single_subtitle(en_sub_path: str) -> bool:
         logger.info(f"Applied {TIME_OFFSET_MS}ms offset to all {len(subs)} subtitles.")
 
     # Save
-    if en_sub_path.endswith(".en.srt"):
-        new_path = en_sub_path.replace(".en.srt", ".zh-TW.srt")
-    elif en_sub_path.endswith(".srt"):
-        base_name = en_sub_path[:-4]
-        new_path = f"{base_name}(AI).zh-TW.srt"
-    else:
-        new_path = en_sub_path + ".zh-TW.srt"
-        
+    new_path = output_subtitle_path(en_sub_path)
     await asyncio.to_thread(subs.save, new_path, encoding="utf-8")
 
     try:
@@ -606,7 +599,7 @@ async def process_movie(input_path: str):
         # Process video files whose translation doesn't exist yet
         for video_file in sorted(video_files):
             base    = os.path.splitext(video_file)[0]
-            zh_path = os.path.join(movie_dir, f"{base}.zh-TW.srt")
+            zh_path = sidecar_subtitle_path(os.path.join(movie_dir, video_file))
             if os.path.exists(zh_path):
                 logger.info(f"EPISODE: Skipping {video_file}, zh-TW.srt already exists.")
                 continue
@@ -641,13 +634,7 @@ async def process_movie(input_path: str):
             return
 
         # Skip if zh-TW already exists for this specific file.
-        # Must match the save-path logic in translate_single_subtitle.
-        if en_sub_path.endswith(".en.srt"):
-            zh_path = en_sub_path.replace(".en.srt", ".zh-TW.srt")
-        elif en_sub_path.endswith(".srt"):
-            zh_path = f"{en_sub_path[:-4]}(AI).zh-TW.srt"
-        else:
-            zh_path = en_sub_path + ".zh-TW.srt"
+        zh_path = output_subtitle_path(en_sub_path)
         if os.path.exists(zh_path):
             logger.info(f"SKIP: {zh_path} already exists.")
             mark_done_in_queue(input_path)
