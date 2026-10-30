@@ -3,6 +3,19 @@ import os
 DEFAULT_TARGET_LANG = "zh-TW"
 SOURCE_LANG = "en"
 
+# The target languages the picker offers, default first.
+LANGUAGES = {
+    "zh-TW": "Traditional Chinese (Taiwan)",
+    "zh-CN": "Simplified Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "en": "English",
+}
+
+
+def language_name(code: str) -> str:
+    return LANGUAGES.get(code, code)
+
 
 def canonical_lang(code: str) -> str:
     """BCP-47 casing, so "zh-tw" and "ZH-TW" name the same file as "zh-TW":

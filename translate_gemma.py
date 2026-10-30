@@ -2,15 +2,47 @@ import os
 import time
 import asyncio
 import logging
+import re
 import requests
 
-from subtitle_files import SOURCE_LANG
+from subtitle_files import SOURCE_LANG, language_name
 
 logger = logging.getLogger("SubtitleAPI")
 
 TRANSLATE_GEMMA_MODEL = os.getenv("TRANSLATE_GEMMA_MODEL", "translatemgemma")
 TRANSLATE_GEMMA_URL = os.getenv("TRANSLATE_GEMMA_URL", "http://localhost:8080")
 TRANSLATE_GEMMA_API_KEY = os.getenv("TRANSLATE_GEMMA_API_KEY", "random_key")
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def uses_translategemma_prompt(model: str) -> bool:
+    """TranslateGemma needs its structured request (language codes beside the
+    text); every other model gets a plain chat prompt. The configured default
+    model is TranslateGemma by definition of TRANSLATE_GEMMA_MODEL."""
+    return "translategemma" in model.lower() or model == TRANSLATE_GEMMA_MODEL
+
+
+def list_models(http=requests) -> list[dict]:
+    """The models llama-swap serves, from its OpenAI-compatible
+    GET /v1/models (the list Open WebUI reads). Alias entries are left out so
+    each model appears once. Raises requests.RequestException when llama-swap
+    can't be reached."""
+    response = http.get(f"{TRANSLATE_GEMMA_URL.rstrip('/')}/v1/models",
+                        headers={"Authorization": f"Bearer {TRANSLATE_GEMMA_API_KEY}"}, timeout=5)
+    response.raise_for_status()
+    models = []
+    for record in response.json().get("data", []):
+        llamaswap = (record.get("meta") or {}).get("llamaswap") or {}
+        if llamaswap.get("type") == "alias":
+            continue
+        models.append({
+            "id": record["id"],
+            "name": record.get("name") or record["id"],
+            "loaded": (record.get("status") or {}).get("value") == "loaded",
+        })
+    return sorted(models, key=lambda m: m["name"].lower())
 
 
 class TranslateGemmaClient:
@@ -42,9 +74,8 @@ class TranslateGemmaClient:
         prompt = f"""{instructions}INPUT:
 {batch_text}"""
 
-        payload = {
-            "model": model,
-            "messages": [
+        if uses_translategemma_prompt(model):
+            messages = [
                 {
                     "role": "user",
                     "content": [
@@ -56,9 +87,21 @@ class TranslateGemmaClient:
                         }
                     ],
                 }
-            ],
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": (
+                    f"You translate English subtitles into {language_name(target_lang)} "
+                    f"({target_lang}).\n\n{instructions}")},
+                {"role": "user", "content": f"INPUT:\n{batch_text}"},
+            ]
+        payload = {
+            "model": model,
+            "messages": messages,
             "temperature": 0.7,
             "max_tokens": 4096,
+            # Qwen-style models think aloud unless told not to.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         for attempt in range(3):
@@ -83,7 +126,7 @@ class TranslateGemmaClient:
                     continue
 
                 data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                return _THINK_RE.sub("", data["choices"][0]["message"]["content"]).strip()
 
             except Exception as e:
                 logger.warning(f"TranslateGemma request failed (attempt {attempt + 1}): {e}")

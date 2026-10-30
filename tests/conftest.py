@@ -56,16 +56,21 @@ class FakeLlamaSwap:
     def __init__(self, status_code=200):
         self.status_code = status_code
         self.requests = []
+        self.prefix = ""   # e.g. a <think> block a reasoning model emits first
 
     def post(self, url, headers=None, json=None, timeout=None):
         self.requests.append({"url": url, "json": json})
         if self.status_code != 200:
             return FakeResponse(self.status_code, "server error")
-        item = json["messages"][0]["content"][0]
-        body = item["text"].split("INPUT:", 1)[1]
-        target = item["target_lang_code"]
+        content = json["messages"][0]["content"]
+        if isinstance(content, list):          # TranslateGemma's structured request
+            body = content[0]["text"].split("INPUT:", 1)[1]
+            target = content[0]["target_lang_code"]
+        else:                                  # plain chat prompt: system names the language
+            body = json["messages"][1]["content"].split("INPUT:", 1)[1]
+            target = re.search(r"\((\S+)\)\.", content).group(1)
         reply = "\n".join(f"[{i}] {target}: {t}" for i, t in _LINE_RE.findall(body))
-        return FakeResponse(200, reply)
+        return FakeResponse(200, self.prefix + reply)
 
 
 class FakeGemini:
