@@ -32,3 +32,7 @@ def test_a_videos_subtitle_is_named_after_the_video(lang):
 ])
 def test_language_codes_get_bcp47_casing(code, canonical):
     assert canonical_lang(code) == canonical
+
+
+def test_an_upper_case_EN_source_gets_the_plain_target_name():
+    assert output_subtitle_path("/media/M/Movie.EN.srt", "ja") == "/media/M/Movie.ja.srt"

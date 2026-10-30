@@ -294,3 +294,31 @@ def test_a_gemini_default_without_an_api_key_still_translates_locally(media, lla
 
     assert [r["json"]["model"] for r in llama.requests] == ["translatemgemma"]
     assert lines(media / "Movie.zh-TW.srt")[0] == (500, 1500, "zh-TW: Hello")
+
+
+def test_only_english_subtitles_in_a_folder_are_translated(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.fr.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert sorted(p.name for p in media.iterdir()) == ["Movie.en.srt", "Movie.fr.srt", "Movie.zh-TW.srt"]
+
+
+def test_a_single_english_subtitle_path_translates_that_file_not_its_neighbour(media, llama):
+    (media / "A.en.srt").write_text(SAMPLE_SRT)
+    (media / "B.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media / "B.en.srt")
+    translate(media / "A.en.srt")
+
+    assert sorted(p.name for p in media.iterdir()) == ["A.en.srt", "A.zh-TW.srt", "B.en.srt", "B.zh-TW.srt"]
+
+
+def test_a_video_path_uses_the_english_subtitle_next_to_it(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.mkv").write_bytes(b"")
+
+    translate(media / "Movie.mkv")
+
+    assert (media / "Movie.zh-TW.srt").exists()
