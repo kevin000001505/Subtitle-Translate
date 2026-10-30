@@ -1,4 +1,6 @@
 import asyncio
+import shutil
+import subprocess
 import re
 
 import pytest
@@ -108,3 +110,22 @@ def media(tmp_path):
     folder = tmp_path / "media" / "Movie (2020)"
     folder.mkdir(parents=True)
     return folder
+
+
+@pytest.fixture
+def make_mkv(tmp_path):
+    """Writes a tiny MKV with an English subtitle track (needs ffmpeg)."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+
+    def make(path):
+        srt = tmp_path / "source.srt"
+        srt.write_text(SAMPLE_SRT)
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=16x16:d=5",
+             "-i", str(srt), "-map", "0", "-map", "1", "-c:v", "ffv1", "-c:s", "srt",
+             "-metadata:s:s:0", "language=eng", "-y", str(path)],
+            check=True,
+        )
+        return path
+    return make

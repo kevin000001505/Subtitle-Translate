@@ -24,7 +24,6 @@ except ImportError:
     genai = None
 
 # ================= CONFIGURATION =================
-TARGET_LANG = DEFAULT_TARGET_LANG
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
@@ -441,22 +440,22 @@ async def generate_with_gemini(prompt, model, index):
                 return None
             await asyncio.sleep((attempt + 1) * 2)
 
-async def generate_with_llama_swap(batch_text, context_text, model):
+async def generate_with_llama_swap(batch_text, context_text, model, target_lang):
     for attempt in range(3):
-        result_text = await translate_gemma_client.translate(batch_text, context_text, model)
+        result_text = await translate_gemma_client.translate(batch_text, context_text, model, target_lang)
         if result_text is not None:
             return result_text
         if attempt < 2:
             await asyncio.sleep((attempt + 1) * 2)
     return None
 
-async def process_single_chunk(index, batch, context_text, total_chunks, progress_counter, translator):
+async def process_single_chunk(index, batch, context_text, total_chunks, progress_counter, translator, target_lang):
     async with sem: 
         batch_text = "\n".join([f"[{idx}] {sub.text}" for idx, sub in batch])
         
         prompt = f"""
         CONTEXT: The movie is about: {context_text[:2000]}...
-        TASK: Translate to {TARGET_LANG}.
+        TASK: Translate to {target_lang}.
         
         CRITICAL RULES:
         1. Format MUST be: [ID] Translated Text
@@ -470,7 +469,7 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
         if translator.backend == "gemini":
             result_text = await generate_with_gemini(prompt, translator.model, index)
         else:
-            result_text = await generate_with_llama_swap(batch_text, context_text, translator.model)
+            result_text = await generate_with_llama_swap(batch_text, context_text, translator.model, target_lang)
             if result_text is None:
                 if not (translator.gemini_fallback and client is not None):
                     logger.error(f"Failed chunk {index}: TranslateGemma returned None")
@@ -487,7 +486,8 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
 
         return result_text
 
-async def translate_single_subtitle(en_sub_path: str, translator: Translator | None = None) -> bool:
+async def translate_single_subtitle(en_sub_path: str, translator: Translator | None = None,
+                                    target_lang: str = DEFAULT_TARGET_LANG) -> bool:
     """
     Translate a single subtitle file to Chinese.
     Returns True if successful, False otherwise.
@@ -517,7 +517,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     progress_counter = {'completed': 0}
     
     for i, batch in enumerate(chunks):
-        task = process_single_chunk(i, batch, full_text_preview, total_chunks, progress_counter, translator)
+        task = process_single_chunk(i, batch, full_text_preview, total_chunks, progress_counter, translator, target_lang)
         tasks.append(task)
 
     results = await asyncio.gather(*tasks)
@@ -543,7 +543,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
         logger.info(f"Applied {TIME_OFFSET_MS}ms offset to all {len(subs)} subtitles.")
 
     # Save
-    new_path = output_subtitle_path(en_sub_path)
+    new_path = output_subtitle_path(en_sub_path, target_lang)
     await asyncio.to_thread(subs.save, new_path, encoding="utf-8")
 
     try:
@@ -556,7 +556,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     logger.info(f"DONE: Saved {new_path}")
     return True
 
-async def process_movie(input_path: str, translator: Translator | None = None):
+async def process_movie(input_path: str, translator: Translator | None = None, target_lang: str = DEFAULT_TARGET_LANG):
     """
     Main entry point. Handles both single files and series folders.
     - If input_path is a file: translate its subtitle
@@ -586,24 +586,24 @@ async def process_movie(input_path: str, translator: Translator | None = None):
         processed_bases = set()
         for srt_file in sorted(srt_files):
             base     = srt_file[:-len(".en.srt")]
-            zh_path  = os.path.join(movie_dir, f"{base}.zh-TW.srt")
-            if os.path.exists(zh_path):
-                logger.info(f"EPISODE: Skipping {srt_file}, zh-TW.srt already exists.")
+            srt_path = os.path.join(movie_dir, srt_file)
+            out_path = output_subtitle_path(srt_path, target_lang)
+            if os.path.exists(out_path):
+                logger.info(f"EPISODE: Skipping {srt_file}, {os.path.basename(out_path)} already exists.")
                 processed_bases.add(base.lower())
                 continue
-            srt_path = os.path.join(movie_dir, srt_file)
             processed_bases.add(base.lower())
             logger.info(f"EPISODE: Translating {srt_file}")
-            success = await translate_single_subtitle(srt_path, translator)
+            success = await translate_single_subtitle(srt_path, translator, target_lang)
             if not success:
                 logger.warning(f"EPISODE: Failed to translate {srt_path}")
 
         # Process video files whose translation doesn't exist yet
         for video_file in sorted(video_files):
             base    = os.path.splitext(video_file)[0]
-            zh_path = sidecar_subtitle_path(os.path.join(movie_dir, video_file))
-            if os.path.exists(zh_path):
-                logger.info(f"EPISODE: Skipping {video_file}, zh-TW.srt already exists.")
+            out_path = sidecar_subtitle_path(os.path.join(movie_dir, video_file), target_lang)
+            if os.path.exists(out_path):
+                logger.info(f"EPISODE: Skipping {video_file}, {os.path.basename(out_path)} already exists.")
                 continue
             if base.lower() in processed_bases:
                 logger.info(f"EPISODE: Skipping {video_file}, .en.srt already processed.")
@@ -614,7 +614,7 @@ async def process_movie(input_path: str, translator: Translator | None = None):
             if en_sub_path is None:
                 logger.warning(f"EPISODE: Could not extract subtitle from {video_file}")
                 continue
-            success = await translate_single_subtitle(en_sub_path, translator)
+            success = await translate_single_subtitle(en_sub_path, translator, target_lang)
             if not success:
                 logger.warning(f"EPISODE: Failed to translate {en_sub_path}")
 
@@ -635,14 +635,14 @@ async def process_movie(input_path: str, translator: Translator | None = None):
             mark_done_in_queue(input_path)
             return
 
-        # Skip if zh-TW already exists for this specific file.
-        zh_path = output_subtitle_path(en_sub_path)
-        if os.path.exists(zh_path):
-            logger.info(f"SKIP: {zh_path} already exists.")
+        # Skip if the translation already exists for this specific file.
+        out_path = output_subtitle_path(en_sub_path, target_lang)
+        if os.path.exists(out_path):
+            logger.info(f"SKIP: {out_path} already exists.")
             mark_done_in_queue(input_path)
             return
 
-        success = await translate_single_subtitle(en_sub_path, translator)
+        success = await translate_single_subtitle(en_sub_path, translator, target_lang)
         if success:
             log_history(input_path, "translate")
         mark_done_in_queue(input_path)

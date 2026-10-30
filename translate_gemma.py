@@ -23,7 +23,8 @@ class TranslateGemmaClient:
         self._min_interval = 0.1  # 100ms between requests to avoid overwhelming local server
         self._rate_lock = asyncio.Lock()
 
-    async def translate(self, batch_text: str, context_text: str = "", model: str = TRANSLATE_GEMMA_MODEL) -> str | None:
+    async def translate(self, batch_text: str, context_text: str = "", model: str = TRANSLATE_GEMMA_MODEL,
+                        target_lang: str = "zh-TW") -> str | None:
         url = f"{self.base_url}/v1/chat/completions"
         instructions = (
             "CRITICAL RULES:\n"
@@ -48,7 +49,7 @@ class TranslateGemmaClient:
                         {
                             "type": "text",
                             "source_lang_code": "en",
-                            "target_lang_code": "zh-TW",
+                            "target_lang_code": target_lang,
                             "text": prompt,
                         }
                     ],
