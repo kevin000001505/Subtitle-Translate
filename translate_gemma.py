@@ -14,7 +14,6 @@ TRANSLATE_GEMMA_API_KEY = os.getenv("TRANSLATE_GEMMA_API_KEY", "random_key")
 class TranslateGemmaClient:
     def __init__(self):
         self.base_url = TRANSLATE_GEMMA_URL.rstrip("/")
-        self.model = TRANSLATE_GEMMA_MODEL
         self.api_key = TRANSLATE_GEMMA_API_KEY
         self.headers = {
             "Content-Type": "application/json",
@@ -24,7 +23,7 @@ class TranslateGemmaClient:
         self._min_interval = 0.1  # 100ms between requests to avoid overwhelming local server
         self._rate_lock = asyncio.Lock()
 
-    async def translate(self, batch_text: str, context_text: str = "") -> str | None:
+    async def translate(self, batch_text: str, context_text: str = "", model: str = TRANSLATE_GEMMA_MODEL) -> str | None:
         url = f"{self.base_url}/v1/chat/completions"
         instructions = (
             "CRITICAL RULES:\n"
@@ -41,7 +40,7 @@ class TranslateGemmaClient:
 {batch_text}"""
 
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": [
                 {
                     "role": "user",

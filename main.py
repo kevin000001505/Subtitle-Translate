@@ -14,7 +14,8 @@ import json
 import uuid
 import subprocess
 from contextlib import asynccontextmanager
-from translate_gemma import TranslateGemmaClient
+from dataclasses import dataclass
+from translate_gemma import TRANSLATE_GEMMA_MODEL, TranslateGemmaClient
 from subtitle_files import DEFAULT_TARGET_LANG, output_subtitle_path, sidecar_subtitle_path
 
 try:
@@ -33,8 +34,27 @@ client = genai.Client(api_key=GEMINI_API_KEY) if (GEMINI_API_KEY and genai) else
 # TranslateGemma (local llama.cpp server)
 translate_gemma_client = TranslateGemmaClient()
 
-# Which translator to use: "translatemgemma" or "gemini"
+# Which translator to use by default: "translatemgemma" or "gemini"
 TRANSLATOR_BACKEND = os.getenv("TRANSLATOR_BACKEND", "translatemgemma")
+
+
+@dataclass(frozen=True)
+class Translator:
+    """Which model translates a subtitle.
+
+    backend is "llama-swap" (a local model behind the OpenAI-compatible API)
+    or "gemini"; model is that backend's model id. gemini_fallback retries a
+    failed local chunk on Gemini."""
+    backend: str
+    model: str
+    gemini_fallback: bool = False
+
+
+def default_translator() -> Translator:
+    """The translator the app used before it could be chosen per request."""
+    if TRANSLATOR_BACKEND == "gemini" and client is not None:
+        return Translator(backend="gemini", model=GEMINI_MODEL)
+    return Translator(backend="llama-swap", model=TRANSLATE_GEMMA_MODEL, gemini_fallback=True)
 
 # --- PLAYBACK SYNC CONTROL ---
 # Set to -1000 to show Chinese subtitles 1 second EARLIER.
@@ -409,7 +429,28 @@ def parse_gemini_response(response_text):
         updates[sub_id] = text
     return updates
 
-async def process_single_chunk(index, batch, context_text, total_chunks, progress_counter):
+async def generate_with_gemini(prompt, model, index):
+    for attempt in range(3):
+        try:
+            response = await client.aio.models.generate_content(model=model, contents=prompt)
+            log_api_call()
+            return response.text
+        except Exception as e:
+            if attempt == 2:
+                logger.error(f"Failed chunk {index} (gemini): {e}")
+                return None
+            await asyncio.sleep((attempt + 1) * 2)
+
+async def generate_with_llama_swap(batch_text, context_text, model):
+    for attempt in range(3):
+        result_text = await translate_gemma_client.translate(batch_text, context_text, model)
+        if result_text is not None:
+            return result_text
+        if attempt < 2:
+            await asyncio.sleep((attempt + 1) * 2)
+    return None
+
+async def process_single_chunk(index, batch, context_text, total_chunks, progress_counter, translator):
     async with sem: 
         batch_text = "\n".join([f"[{idx}] {sub.text}" for idx, sub in batch])
         
@@ -426,56 +467,16 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
         {batch_text}
         """
 
-        gemini_fallback_used = False
-        result_text = None
-
-        # Primary translator (TranslateGemma or Gemini based on config)
-        if TRANSLATOR_BACKEND == "gemini" and client is not None:
-            for attempt in range(3):
-                try:
-                    response = await client.aio.models.generate_content(
-                        model=GEMINI_MODEL, contents=prompt
-                    )
-                    log_api_call()
-                    result_text = response.text
-                    break
-                except Exception as e:
-                    wait_time = (attempt + 1) * 2
-                    if attempt == 2:
-                        logger.error(f"Failed chunk {index}: {e}")
-                        return None
-                    await asyncio.sleep(wait_time)
+        if translator.backend == "gemini":
+            result_text = await generate_with_gemini(prompt, translator.model, index)
         else:
-            for attempt in range(3):
-                try:
-                    result_text = await translate_gemma_client.translate(batch_text, context_text)
-                    if result_text is None:
-                        raise Exception("TranslateGemma returned None")
-                    break
-                except Exception as e:
-                    wait_time = (attempt + 1) * 2
-                    if attempt == 2:
-                        if client is not None:
-                            gemini_fallback_used = True
-                            logger.warning(f"TranslateGemma failed for chunk {index}, falling back to Gemini: {e}")
-                            for g_attempt in range(3):
-                                try:
-                                    response = await client.aio.models.generate_content(
-                                        model=GEMINI_MODEL, contents=prompt
-                                    )
-                                    log_api_call()
-                                    result_text = response.text
-                                    break
-                                except Exception as g_e:
-                                    g_wait = (g_attempt + 1) * 2
-                                    if g_attempt == 2:
-                                        logger.error(f"Failed chunk {index} (gemini fallback): {g_e}")
-                                        return None
-                                    await asyncio.sleep(g_wait)
-                            break
-                        logger.error(f"Failed chunk {index}: {e}")
-                        return None
-                    await asyncio.sleep(wait_time)
+            result_text = await generate_with_llama_swap(batch_text, context_text, translator.model)
+            if result_text is None:
+                if not (translator.gemini_fallback and client is not None):
+                    logger.error(f"Failed chunk {index}: TranslateGemma returned None")
+                    return None
+                logger.warning(f"TranslateGemma failed for chunk {index}, falling back to Gemini")
+                result_text = await generate_with_gemini(prompt, GEMINI_MODEL, index)
 
         if result_text:
             progress_counter['completed'] += 1
@@ -486,11 +487,12 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
 
         return result_text
 
-async def translate_single_subtitle(en_sub_path: str) -> bool:
+async def translate_single_subtitle(en_sub_path: str, translator: Translator | None = None) -> bool:
     """
     Translate a single subtitle file to Chinese.
     Returns True if successful, False otherwise.
     """
+    translator = translator or default_translator()
     logger.info(f"START: Processing {en_sub_path}")
 
     try:
@@ -515,7 +517,7 @@ async def translate_single_subtitle(en_sub_path: str) -> bool:
     progress_counter = {'completed': 0}
     
     for i, batch in enumerate(chunks):
-        task = process_single_chunk(i, batch, full_text_preview, total_chunks, progress_counter)
+        task = process_single_chunk(i, batch, full_text_preview, total_chunks, progress_counter, translator)
         tasks.append(task)
 
     results = await asyncio.gather(*tasks)
@@ -554,7 +556,7 @@ async def translate_single_subtitle(en_sub_path: str) -> bool:
     logger.info(f"DONE: Saved {new_path}")
     return True
 
-async def process_movie(input_path: str):
+async def process_movie(input_path: str, translator: Translator | None = None):
     """
     Main entry point. Handles both single files and series folders.
     - If input_path is a file: translate its subtitle
@@ -592,7 +594,7 @@ async def process_movie(input_path: str):
             srt_path = os.path.join(movie_dir, srt_file)
             processed_bases.add(base.lower())
             logger.info(f"EPISODE: Translating {srt_file}")
-            success = await translate_single_subtitle(srt_path)
+            success = await translate_single_subtitle(srt_path, translator)
             if not success:
                 logger.warning(f"EPISODE: Failed to translate {srt_path}")
 
@@ -612,7 +614,7 @@ async def process_movie(input_path: str):
             if en_sub_path is None:
                 logger.warning(f"EPISODE: Could not extract subtitle from {video_file}")
                 continue
-            success = await translate_single_subtitle(en_sub_path)
+            success = await translate_single_subtitle(en_sub_path, translator)
             if not success:
                 logger.warning(f"EPISODE: Failed to translate {en_sub_path}")
 
@@ -640,7 +642,7 @@ async def process_movie(input_path: str):
             mark_done_in_queue(input_path)
             return
 
-        success = await translate_single_subtitle(en_sub_path)
+        success = await translate_single_subtitle(en_sub_path, translator)
         if success:
             log_history(input_path, "translate")
         mark_done_in_queue(input_path)
