@@ -457,10 +457,52 @@ def test_a_show_whose_files_are_all_unmapped_is_reported_as_unmapped(library):
     bridged = {"Items": [dict(e, Path=e["Path"].replace("/data/media", "/data/JellyBridge"))
                          for e in JELLYFIN_EPISODES["Items"] if "Path" in e]}
     library.http.routes[("GET", "/Shows/s1/Episodes")] = bridged
-    library.http.request_override = bridged
+    library.http.episode_items = bridged
 
     titles = {t["name"]: t for t in library.client.get("/library/jellyfin").json()["titles"]}
     result = queue(library, items=[{"kind": "show", "id": "s1"}])
 
     assert titles["Severance"]["status"] == "unmapped"
     assert result["unmapped"] == ["Severance S01E01", "Severance S01E02"]
+
+
+def reply_with(monkeypatch, llama, rewrite):
+    import translate_gemma
+    original = llama.post
+
+    def patched(url, headers=None, json=None, timeout=None):
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        response._content = rewrite(response._content)
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", patched)
+
+
+def test_a_reply_that_merges_lines_fails_the_job(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.splitlines()[0] + " (and the rest)")
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_reply_numbered_from_one_fails_the_job(library, llama, monkeypatch):
+    import re
+    reply_with(monkeypatch, llama, lambda text: re.sub(r"\[(\d+)\]", lambda m: f"[{int(m.group(1)) + 1}]", text))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_reply_with_ids_from_outside_the_chunk_never_overwrites_other_lines(media, llama, monkeypatch):
+    import re
+    reply_with(monkeypatch, llama, lambda text: text + "\n[999] stray\n[1] wrong place" if "[0]" in text else text)
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    asyncio.run(main.process_movie(str(media)))      # legacy path: partial results are still saved
+
+    import pysubs2
+    texts = [s.text for s in pysubs2.load(str(media / "Movie.zh-TW.srt"))]
+    assert "stray" not in " ".join(texts)

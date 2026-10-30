@@ -60,11 +60,15 @@ class Translator:
 
 @dataclass
 class TranslationOutcome:
-    """Why translate_single_subtitle returned what it did."""
+    """What translate_single_subtitle did; truthy when the file was saved."""
+    ok: bool = False
     limit: bool = False          # stopped at the Gemini daily limit
     failed_chunks: int = 0       # chunks with no usable [ID] line
     total_chunks: int = 0
     reason: str = ""             # why nothing was attempted
+
+    def __bool__(self):
+        return self.ok
 
 
 def default_translator() -> Translator:
@@ -528,22 +532,21 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
 
 async def translate_single_subtitle(en_sub_path: str, translator: Translator | None = None,
                                     target_lang: str = DEFAULT_TARGET_LANG, progress=None,
-                                    queue_on_limit: bool = True, require_all: bool = False,
-                                    outcome: TranslationOutcome | None = None) -> bool:
+                                    queue_on_limit: bool = True,
+                                    require_all: bool = False) -> TranslationOutcome:
     """
     Translate a single subtitle file to target_lang.
-    Returns True if successful, False otherwise. progress(fraction) is called
+    Returns a TranslationOutcome, truthy when the file was saved. progress(fraction) is called
     as chunks finish. At the daily limit the file goes to the legacy queue,
     unless queue_on_limit is False (a library job waits in the job queue).
     require_all refuses to save when any chunk failed, so a retry is possible.
-    outcome, when given, is filled in with why the call ended as it did.
     """
-    outcome = TranslationOutcome() if outcome is None else outcome
+    outcome = TranslationOutcome()
     translator = translator or default_translator()
     if translator.backend == "gemini" and client is None:
         logger.error(f"Cannot translate {en_sub_path} with {translator.model}: GEMINI_API_KEY is not set")
         outcome.reason = f"{translator.model} needs Gemini, but GEMINI_API_KEY is not set"
-        return False
+        return outcome
     logger.info(f"START: Processing {en_sub_path}")
 
     try:
@@ -551,7 +554,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     except Exception as e:
         logger.error(f"Failed to load subtitle {en_sub_path}: {e}")
         outcome.reason = f"Could not read the English subtitle {os.path.basename(en_sub_path)}"
-        return False
+        return outcome
 
     chunks = get_smart_chunks(subs)
     total_chunks = len(chunks)
@@ -563,7 +566,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
         outcome.limit = True
         if queue_on_limit:
             add_to_queue(en_sub_path, target_lang)
-        return False
+        return outcome
 
     logger.info(f"Translating {total_chunks} chunks (Concurrency: {CONCURRENCY_LIMIT})...")
     full_text_preview = " ".join([s.text.replace("\n", " ") for s in subs[:500]])
@@ -577,18 +580,21 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
 
     results = await asyncio.gather(*tasks)
 
-    # A chunk counts only when its reply has [ID] lines for its own subtitles.
+    # A reply may only touch its own chunk's lines; it counts as a full
+    # translation only when it has exactly those [ID]s (not merged, not
+    # renumbered from 1). The legacy path still saves partial chunks.
     usable = []
     for batch, raw_text in zip(chunks, results):
         ids = {idx for idx, _ in batch}
-        updates = {i: t for i, t in parse_gemini_response(raw_text).items() if i in ids} if raw_text else {}
-        usable.append(updates)
-    outcome.failed_chunks = sum(1 for updates in usable if not updates)
+        parsed = parse_gemini_response(raw_text) if raw_text else {}
+        usable.append({i: t for i, t in parsed.items() if i in ids})
+        if set(parsed) != ids:
+            outcome.failed_chunks += 1
     outcome.total_chunks = total_chunks
     if require_all and outcome.failed_chunks:
         logger.error(f"FAILED: {outcome.failed_chunks} of {total_chunks} chunks of {en_sub_path} "
                      f"had no usable translation; nothing saved")
-        return False
+        return outcome
 
     # Apply translations
     success_count = 0
@@ -602,7 +608,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
         # Saving would write the English text under the target name, and the
         # skip check would then block every retry.
         logger.error(f"FAILED: no line of {en_sub_path} was translated; nothing saved")
-        return False
+        return outcome
 
     # Apply timing offset to ALL subtitles so every line is shifted consistently,
     # including any lines the translation skipped or left untouched.
@@ -624,7 +630,8 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
         pass
 
     logger.info(f"DONE: Saved {new_path}")
-    return True
+    outcome.ok = True
+    return outcome
 
 async def process_movie(input_path: str, translator: Translator | None = None, target_lang: str = DEFAULT_TARGET_LANG):
     """
@@ -885,16 +892,16 @@ async def run_translate_job(job, report) -> tuple[str, str]:
         if source is None:
             return "failed", "No English subtitle (no .en.srt and none in the video)"
     translator = Translator(backend=job["backend"], model=job["model"])
-    outcome = TranslationOutcome()
-    if await translate_single_subtitle(source, translator, lang, progress=report, queue_on_limit=False,
-                                       require_all=True, outcome=outcome):
+    outcome = await translate_single_subtitle(source, translator, lang, progress=report,
+                                              queue_on_limit=False, require_all=True)
+    if outcome:
         return "done", f"Wrote {os.path.basename(out_path)}"
     if outcome.limit:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
     if outcome.failed_chunks:
-        return "failed", (f"{outcome.failed_chunks} of {outcome.total_chunks} chunks came back with no usable "
-                          f"lines from {job['model']}; nothing was saved, so it can be retried")
+        return "failed", (f"{outcome.failed_chunks} of {outcome.total_chunks} chunks came back with missing or "
+                          f"no usable lines from {job['model']}; nothing was saved, so it can be retried")
     return "failed", outcome.reason or f"Translation with {job['model']} failed"
 
 

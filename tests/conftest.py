@@ -154,7 +154,7 @@ class FakeHttp:
 
     def request(self, method, url, params=None, headers=None, timeout=None):
         path = "/" + url.split("://", 1)[1].split("/", 1)[1]
-        self.calls.append({"method": method, "path": path, "params": params, "headers": headers})
+        self.calls.append({"method": method, "path": path, "params": params, "headers": headers, "timeout": timeout})
         body = self.routes.get((method, path), 404)
 
         class _Resp:
@@ -196,11 +196,14 @@ def jellyfin_routes():
 
 
 class FakeJellyfinHttp(FakeHttp):
-    """/Items answers with titles or with all episodes depending on IncludeItemTypes."""
+    """/Items answers with titles or with all episodes depending on IncludeItemTypes;
+    set episode_items to change the episode listing."""
+
+    episode_items = None
 
     def request(self, method, url, params=None, headers=None, timeout=None):
         if url.endswith("/Items") and params:
-            episodes = getattr(self, "request_override", None) or JELLYFIN_EPISODES
+            episodes = self.episode_items or JELLYFIN_EPISODES
             self.routes[("GET", "/Items")] = (
                 episodes if params.get("IncludeItemTypes") == "Episode" else JELLYFIN_ITEMS)
         return super().request(method, url, params, headers, timeout)

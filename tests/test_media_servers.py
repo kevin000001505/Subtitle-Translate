@@ -146,3 +146,10 @@ def test_plex_groups_all_episodes_by_show():
     by_show = plex(EpisodeAwareHttp(dict(PLEX_ROUTES))).episodes_by_show()
 
     assert [(e.id, e.path) for e in by_show["20"]] == [("21", "/media/TV/S01E01.mkv")]
+
+
+@pytest.mark.parametrize("make", [jellyfin, plex])
+def test_posters_give_up_quickly_on_a_hung_server(make):
+    http = FakeJellyfinHttp(jellyfin_routes()) if make is jellyfin else FakeHttp(dict(PLEX_ROUTES))
+    make(http).poster("m1" if make is jellyfin else "10")
+    assert http.calls[-1]["timeout"] <= 5

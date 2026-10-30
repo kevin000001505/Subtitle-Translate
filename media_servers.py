@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import requests
 
 TIMEOUT = 15
+POSTER_TIMEOUT = 3   # a hung server must not hold browser connections for long
 
 
 class PathMap:
@@ -80,10 +81,10 @@ class _Server:
         self.path_map = path_map
         self.http = http or requests.Session()
 
-    def _request(self, method, path, params=None):
+    def _request(self, method, path, params=None, timeout=TIMEOUT):
         try:
             response = self.http.request(method, f"{self.url}{path}", params=params,
-                                         headers=self.headers, timeout=TIMEOUT)
+                                         headers=self.headers, timeout=timeout)
         except requests.RequestException as e:
             raise MediaServerError(f"{self.label} is unreachable at {self.url} ({type(e).__name__})") from e
         if response.status_code >= 400:
@@ -100,8 +101,8 @@ class Jellyfin(_Server):
     label = "Jellyfin"
     token_header = "X-Emby-Token"
 
-    def _call(self, method, path, params=None, raw=False):
-        response = self._request(method, path, params)
+    def _call(self, method, path, params=None, raw=False, timeout=TIMEOUT):
+        response = self._request(method, path, params, timeout)
         return response if raw else response.json()
 
     def _episode(self, item) -> Episode:
@@ -152,7 +153,7 @@ class Jellyfin(_Server):
 
     def poster(self, item_id: str):
         response = self._call("GET", f"/Items/{item_id}/Images/Primary",
-                              params={"fillHeight": 450, "quality": 90}, raw=True)
+                              params={"fillHeight": 450, "quality": 90}, raw=True, timeout=POSTER_TIMEOUT)
         return response.content, response.headers.get("Content-Type", "image/jpeg")
 
     def refresh(self, item_id: str):
@@ -167,8 +168,8 @@ class Plex(_Server):
     label = "Plex"
     token_header = "X-Plex-Token"
 
-    def _call(self, method, path, params=None, raw=False):
-        response = self._request(method, path, params)
+    def _call(self, method, path, params=None, raw=False, timeout=TIMEOUT):
+        response = self._request(method, path, params, timeout)
         return response if raw else response.json().get("MediaContainer", {})
 
     @staticmethod
@@ -221,7 +222,7 @@ class Plex(_Server):
         return _by_episode(episodes)
 
     def poster(self, item_id: str):
-        response = self._call("GET", f"/library/metadata/{item_id}/thumb", raw=True)
+        response = self._call("GET", f"/library/metadata/{item_id}/thumb", raw=True, timeout=POSTER_TIMEOUT)
         return response.content, response.headers.get("Content-Type", "image/jpeg")
 
     def refresh(self, item_id: str):
