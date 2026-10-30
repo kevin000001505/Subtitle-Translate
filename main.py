@@ -63,7 +63,8 @@ class TranslationOutcome:
     """What translate_single_subtitle did; truthy when the file was saved."""
     ok: bool = False
     limit: bool = False          # stopped at the Gemini daily limit
-    failed_chunks: int = 0       # chunks with no usable [ID] line
+    failed_chunks: int = 0       # chunks whose reply lacked their exact [ID] lines
+    unanswered_chunks: int = 0   # chunks the model never answered
     total_chunks: int = 0
     reason: str = ""             # why nothing was attempted
 
@@ -587,6 +588,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     for batch, raw_text in zip(chunks, results):
         ids = {idx for idx, _ in batch}
         parsed = parse_gemini_response(raw_text) if raw_text else {}
+        outcome.unanswered_chunks += not raw_text
         usable.append({i: t for i, t in parsed.items() if i in ids})
         if set(parsed) != ids:
             outcome.failed_chunks += 1
@@ -867,6 +869,7 @@ job_wakeup = asyncio.Event()
 # the library stays responsive while a translation fills the default pool;
 # posters get a separate pool so a slow server's posters can't starve them.
 LOOKUP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lookup")
+MODELS_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="models")
 POSTER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poster")
 GEMINI_RETRY_SECONDS = 600
 _gemini_blocked_until = 0.0
@@ -899,6 +902,9 @@ async def run_translate_job(job, report) -> tuple[str, str]:
     if outcome.limit:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
+    if outcome.unanswered_chunks == outcome.total_chunks > 0:
+        return "failed", (f"{job['model']} did not answer ({outcome.total_chunks} of {outcome.total_chunks} "
+                          f"chunks); nothing was saved, so it can be retried")
     if outcome.failed_chunks:
         return "failed", (f"{outcome.failed_chunks} of {outcome.total_chunks} chunks came back with missing or "
                           f"no usable lines from {job['model']}; nothing was saved, so it can be retried")
@@ -1016,10 +1022,6 @@ def _subtitle_status(item, lang, active) -> str:
     return "done" if os.path.exists(sidecar_subtitle_path(path, lang)) else "missing"
 
 
-class LibraryQuery(BaseModel):
-    lang: LangCode = DEFAULT_TARGET_LANG
-
-
 @app.get("/config")
 def config_endpoint():
     return {
@@ -1034,7 +1036,7 @@ def config_endpoint():
 async def models_endpoint():
     gemini = {"backend": "gemini", "id": GEMINI_MODEL, "name": f"Gemini ({GEMINI_MODEL})"} if client else None
     try:
-        local = await in_lookup_pool(list_models)
+        local = await asyncio.get_running_loop().run_in_executor(MODELS_POOL, list_models)
         error = None
     except (requests.RequestException, ValueError) as e:
         local, error = [], f"llama-swap is unreachable at {TRANSLATE_GEMMA_URL} ({type(e).__name__})"
@@ -1042,8 +1044,7 @@ async def models_endpoint():
 
 
 @app.get("/library/{server_name}")
-async def library_endpoint(server_name: str, lang: str = DEFAULT_TARGET_LANG, refresh: bool = False):
-    lang = LibraryQuery(lang=lang).lang
+async def library_endpoint(server_name: str, lang: LangCode = DEFAULT_TARGET_LANG, refresh: bool = False):
     titles, episodes_by_show = await _library(server_name, refresh)
     active = jobs.active_targets(DB_FILE)
     result = []
@@ -1076,8 +1077,7 @@ async def library_endpoint(server_name: str, lang: str = DEFAULT_TARGET_LANG, re
 
 
 @app.get("/library/{server_name}/shows/{show_id}")
-async def show_endpoint(server_name: str, show_id: str, lang: str = DEFAULT_TARGET_LANG):
-    lang = LibraryQuery(lang=lang).lang
+async def show_endpoint(server_name: str, show_id: str, lang: LangCode = DEFAULT_TARGET_LANG):
     server = _server(server_name)
     try:
         episodes = await in_lookup_pool(server.episodes, show_id)

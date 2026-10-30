@@ -281,6 +281,7 @@ async function openShow(t) {
     $('show-seasons').innerHTML = '<p class="muted">Loading episodes…</p>';
     const whole = $('show-all');
     whole.checked = state.selection.has(selectionKey('show', t.id));
+    whole.disabled = true;                     // until the episodes say whether any is reachable
     whole.onchange = () => {
         toggleSelection({ kind: 'show', id: t.id, label: t.name }, whole.checked);
         if (whole.checked) clearEpisodesOf(t.id);

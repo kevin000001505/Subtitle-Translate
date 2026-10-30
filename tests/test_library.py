@@ -506,3 +506,17 @@ def test_a_reply_with_ids_from_outside_the_chunk_never_overwrites_other_lines(me
     import pysubs2
     texts = [s.text for s in pysubs2.load(str(media / "Movie.zh-TW.srt"))]
     assert "stray" not in " ".join(texts)
+
+
+def test_a_bad_language_in_a_library_url_is_a_422(library):
+    assert library.client.get("/library/jellyfin?lang=1").status_code == 422
+    assert library.client.get("/library/jellyfin/shows/s1?lang=x1").status_code == 422
+
+
+def test_a_model_that_never_answers_is_named_as_unreachable(library, llama):
+    llama.status_code = 500
+    queue(library, model="qwen3-14b", items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "did not answer" in message and "qwen3-14b" in message
