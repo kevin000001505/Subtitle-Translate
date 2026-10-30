@@ -17,7 +17,9 @@ import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from translate_gemma import TRANSLATE_GEMMA_MODEL, TranslateGemmaClient
-from subtitle_files import DEFAULT_TARGET_LANG, canonical_lang, output_subtitle_path, sidecar_subtitle_path, subtitle_suffix
+from subtitle_files import (DEFAULT_TARGET_LANG, SOURCE_LANG, canonical_lang, is_source_subtitle,
+                            output_subtitle_path, sidecar_subtitle_path, strip_source_suffix,
+                            subtitle_suffix)
 
 try:
     from google import genai
@@ -167,7 +169,7 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
 
         video_path = os.path.join(folder_path, video_file)
         target_srt = sidecar_subtitle_path(video_path, target_lang)
-        en_srt     = sidecar_subtitle_path(video_path, "en")
+        en_srt     = sidecar_subtitle_path(video_path, SOURCE_LANG)
 
         use_srt_ref = (priority in ("srt", "auto")) and os.path.exists(en_srt)
         if use_srt_ref:
@@ -372,8 +374,7 @@ async def extract_english_sub_from_mkv(mkv_path: str) -> str | None:
 
         # Extract to .en.srt
         stream_index = eng_stream["index"]
-        base_name = os.path.splitext(mkv_path)[0]
-        out_srt = f"{base_name}.en.srt"
+        out_srt = sidecar_subtitle_path(mkv_path, SOURCE_LANG)
 
         extract_cmd = [
             "ffmpeg", "-v", "quiet", "-i", mkv_path,
@@ -401,7 +402,7 @@ async def find_or_extract_english_sub(folder: str) -> str | None:
     """
     # 1. Check for existing .en.srt
     for f in os.listdir(folder):
-        if f.lower().endswith(".en.srt"):
+        if is_source_subtitle(f):
             logger.info(f"EXTRACT: Found existing English sub: {f}")
             return os.path.join(folder, f)
 
@@ -592,7 +593,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
         movie_dir = input_path
 
         # Find all .en.srt, MKV, and MP4 files in the folder
-        srt_files   = [f for f in os.listdir(movie_dir) if f.lower().endswith(".en.srt")]
+        srt_files   = [f for f in os.listdir(movie_dir) if is_source_subtitle(f)]
         video_files = [f for f in os.listdir(movie_dir) if f.lower().endswith((".mkv", ".mp4"))]
         if not srt_files and not video_files:
             logger.warning(f"SKIP: No .en.srt or MKV/MP4 files found in {movie_dir}")
@@ -604,7 +605,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
         # Process existing .en.srt files — skip individual episodes already translated
         processed_bases = set()
         for srt_file in sorted(srt_files):
-            base     = srt_file[:-len(".en.srt")]
+            base     = strip_source_suffix(srt_file)
             srt_path = os.path.join(movie_dir, srt_file)
             out_path = output_subtitle_path(srt_path, target_lang)
             if os.path.exists(out_path):
@@ -644,7 +645,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
         # Single file mode — resolve to an .en.srt and translate it
         movie_dir = os.path.dirname(input_path)
 
-        if input_path.lower().endswith(".en.srt"):
+        if is_source_subtitle(input_path):
             en_sub_path = input_path
         else:
             en_sub_path = await find_or_extract_english_sub(movie_dir)
