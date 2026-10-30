@@ -47,6 +47,11 @@ class Episode:
     path: str | None          # backend path, None when missing or not mapped
     server_path: str | None = None
 
+    @property
+    def unmapped(self) -> bool:
+        """The server has a file, but no path-map rule reaches it."""
+        return bool(self.server_path) and not self.path
+
 
 @dataclass
 class Title:
@@ -56,6 +61,10 @@ class Title:
     year: int | None
     path: str | None = None   # movies only: backend path of the video
     server_path: str | None = None
+
+    @property
+    def unmapped(self) -> bool:
+        return bool(self.server_path) and not self.path
 
 
 class MediaServerError(Exception):

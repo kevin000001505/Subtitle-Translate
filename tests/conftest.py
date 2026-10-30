@@ -200,6 +200,7 @@ class FakeJellyfinHttp(FakeHttp):
 
     def request(self, method, url, params=None, headers=None, timeout=None):
         if url.endswith("/Items") and params:
+            episodes = getattr(self, "request_override", None) or JELLYFIN_EPISODES
             self.routes[("GET", "/Items")] = (
-                JELLYFIN_EPISODES if params.get("IncludeItemTypes") == "Episode" else JELLYFIN_ITEMS)
+                episodes if params.get("IncludeItemTypes") == "Episode" else JELLYFIN_ITEMS)
         return super().request(method, url, params, headers, timeout)

@@ -290,18 +290,22 @@ async function openShow(t) {
     $('show-dialog').showModal();
     try {
         const body = await api(`/library/${state.server}/shows/${encodeURIComponent(t.id)}?lang=${encodeURIComponent(state.lang)}`);
+        if (state.show !== t) return;            // another show was opened meanwhile
         state.show.seasons = body.seasons;
         renderSeasons(body.seasons);
     } catch (e) {
+        if (state.show !== t) return;
         $('show-seasons').innerHTML = '';
         $('show-seasons').append(el('p', { className: 'muted', textContent: `Could not load episodes: ${e.message}` }));
     }
 }
 
 async function reloadShowEpisodes() {
+    const show = state.show;
     try {
-        const body = await api(`/library/${state.server}/shows/${encodeURIComponent(state.show.id)}?lang=${encodeURIComponent(state.lang)}`);
-        state.show.seasons = body.seasons;
+        const body = await api(`/library/${state.server}/shows/${encodeURIComponent(show.id)}?lang=${encodeURIComponent(state.lang)}`);
+        if (state.show !== show) return;         // the dialog moved on to another show
+        show.seasons = body.seasons;
         renderSeasons(body.seasons);
     } catch { /* keep the old rows */ }
 }
@@ -314,6 +318,8 @@ function renderSeasons(seasons) {
     const box = $('show-seasons');
     const show = state.show;
     const wholeShow = state.selection.has(selectionKey('show', show.id));
+    const anyReachable = seasons.some(s => s.episodes.some(e => !unreachable(e)));
+    $('show-all').disabled = !anyReachable;
     box.innerHTML = '';
     for (const s of seasons) {
         const available = s.episodes.filter(e => !unreachable(e));
@@ -375,6 +381,7 @@ async function runSelected() {
         const parts = [`Queued ${result.created} job${result.created === 1 ? '' : 's'}`];
         if (result.already_queued) parts.push(`${result.already_queued} already queued`);
         if (result.unavailable.length) parts.push(`${result.unavailable.length} without a file`);
+        if (result.unmapped.length) parts.push(`${result.unmapped.length} outside ${state.server.toUpperCase()}_PATH_MAP`);
         toast(parts.join(' · '));
         clearSelection();
         refreshJobs();

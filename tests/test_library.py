@@ -24,6 +24,7 @@ def library(tmp_path, monkeypatch, llama):
     server = Jellyfin("http://jf:8096", "secret-key", PathMap(f"/data/media:{root}"), http)
     monkeypatch.setattr(main, "SERVERS", {"jellyfin": server})
     monkeypatch.setattr(main, "_library_cache", {})
+    monkeypatch.setattr(main, "_gemini_blocked_until", 0.0)
 
     class Library:
         pass
@@ -95,13 +96,13 @@ def test_the_same_movie_is_not_queued_twice(library):
     queue(library, items=[{"kind": "movie", "id": "m1"}])
 
     assert queue(library, items=[{"kind": "movie", "id": "m1"}]) == \
-        {"created": 0, "already_queued": 1, "unavailable": []}
+        {"created": 0, "already_queued": 1, "unavailable": [], "unmapped": []}
 
 
 def test_a_show_expands_to_one_job_per_episode_with_a_file(library):
     result = queue(library, lang="ja", items=[{"kind": "show", "id": "s1"}])
 
-    assert result == {"created": 2, "already_queued": 0, "unavailable": ["Severance S02E01"]}
+    assert result == {"created": 2, "already_queued": 0, "unavailable": ["Severance S02E01"], "unmapped": []}
     run_all()
     assert (library.show / "S01E01.ja.srt").exists() and (library.show / "S01E02.ja.srt").exists()
 
@@ -302,12 +303,7 @@ def test_a_request_with_different_settings_is_not_dropped_as_a_duplicate(library
 
 
 def test_a_gemini_job_over_the_daily_limit_waits_instead_of_failing(library, gemini, monkeypatch):
-    monkeypatch.setattr(main, "get_calls_last_24h", lambda: main.DAILY_LIMIT - 101)
-    monkeypatch.setattr(main, "DAILY_LIMIT", main.DAILY_LIMIT)
-    long_srt = "".join(f"{i + 1}\n00:{i * 3:02d}:00,000 --> 00:{i * 3:02d}:01,000\nLine {i}\n\n" for i in range(19))
-    many_chunks = long_srt * 1
-    (library.movie / "Arrival.en.srt").write_text(many_chunks)
-    monkeypatch.setattr(main, "get_smart_chunks", lambda subs: [[(i, s)] for i, s in enumerate(subs)] * 6)
+    over_the_limit(monkeypatch)
 
     queue(library, backend="gemini", model="gemini-2.5-flash-lite", items=[{"kind": "movie", "id": "m1"}])
     asyncio.run(main.run_next_job())
@@ -315,6 +311,7 @@ def test_a_gemini_job_over_the_daily_limit_waits_instead_of_failing(library, gem
     job = library.client.get("/jobs").json()["jobs"][0]
     assert job["status"] == "queued" and "daily limit" in job["message"]
     assert gemini.prompts == []
+    assert asyncio.run(main.run_next_job()) is False      # it waits instead of being claimed again
 
 
 def test_an_episode_without_its_show_is_refused(library):
@@ -341,10 +338,17 @@ def test_progress_is_reported_while_translating(library, monkeypatch):
     assert 50.0 in seen
 
 
-def test_library_jobs_never_enter_the_legacy_queue(library, monkeypatch):
-    monkeypatch.setattr(main, "get_calls_last_24h", lambda: main.DAILY_LIMIT)
+def over_the_limit(monkeypatch):
+    """Enough headroom for the worker to start a Gemini job, too little for the file."""
+    monkeypatch.setattr(main, "get_calls_last_24h", lambda: main.DAILY_LIMIT - 101)
+    monkeypatch.setattr(main, "get_smart_chunks", lambda subs: [[(i, s)] for i, s in enumerate(subs)] * 60)
+
+
+def test_library_jobs_never_enter_the_legacy_queue(library, gemini, monkeypatch):
+    over_the_limit(monkeypatch)
     queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
     asyncio.run(main.run_next_job())
+    assert "daily limit" in library.client.get("/jobs").json()["jobs"][0]["message"]
 
     assert main.pop_from_queue() is None
 
@@ -383,3 +387,80 @@ def test_no_response_carries_the_server_key(library, gemini, monkeypatch):
     for path in ("/config", "/models", "/library/jellyfin", "/library/jellyfin/shows/s1", "/poster/jellyfin/m1", "/jobs"):
         response = library.client.get(path)
         assert "secret-key" not in response.text and "secret-key" not in str(response.headers), path
+
+
+def test_a_queued_gemini_job_whose_key_disappeared_says_so(library, gemini, monkeypatch):
+    queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
+    monkeypatch.setattr(main, "client", None)
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "GEMINI_API_KEY" in job["message"]
+
+
+def test_replies_without_any_usable_line_are_reported_as_unusable(library, llama, monkeypatch):
+    llama_post = llama.post
+
+    def no_ids(url, headers=None, json=None, timeout=None):
+        response = llama_post(url, headers=headers, json=json, timeout=timeout)
+        response._content = "Sorry, I cannot help with that."
+        return response
+    import translate_gemma
+    monkeypatch.setattr(translate_gemma.requests, "post", no_ids)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "1 of 1" in job["message"] and "no usable" in job["message"]
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_chunk_whose_reply_has_no_usable_line_fails_the_job(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+
+    def garble_second(url, headers=None, json=None, timeout=None):
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        if "Goodbye" in json["messages"][0]["content"][0]["text"].split("INPUT:")[1]:
+            response._content = "Here is your translation, enjoy!"
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", garble_second)
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (library.movie / "Arrival.en.srt").write_text(two_chunks)
+
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "1 of 2" in job["message"]
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_the_worker_refuses_a_job_that_would_overwrite_the_source(library):
+    jobs.add(main.DB_FILE, op="translate", video_path=str(library.movie / "Arrival.mkv"), target_lang="en",
+             title="Arrival", backend="llama-swap", model="m", overwrite=True)
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert (library.movie / "Arrival.en.srt").read_text() == SAMPLE_SRT
+
+
+def test_a_different_model_or_overwrite_is_a_new_job(library):
+    assert queue(library, model="a", items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, model="b", items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, model="b", overwrite=True, items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, model="b", overwrite=True, items=[{"kind": "movie", "id": "m1"}])["already_queued"] == 1
+
+
+def test_a_show_whose_files_are_all_unmapped_is_reported_as_unmapped(library):
+    from conftest import JELLYFIN_EPISODES
+    bridged = {"Items": [dict(e, Path=e["Path"].replace("/data/media", "/data/JellyBridge"))
+                         for e in JELLYFIN_EPISODES["Items"] if "Path" in e]}
+    library.http.routes[("GET", "/Shows/s1/Episodes")] = bridged
+    library.http.request_override = bridged
+
+    titles = {t["name"]: t for t in library.client.get("/library/jellyfin").json()["titles"]}
+    result = queue(library, items=[{"kind": "show", "id": "s1"}])
+
+    assert titles["Severance"]["status"] == "unmapped"
+    assert result["unmapped"] == ["Severance S01E01", "Severance S01E02"]
