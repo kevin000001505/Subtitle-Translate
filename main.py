@@ -17,7 +17,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from translate_gemma import TRANSLATE_GEMMA_MODEL, TranslateGemmaClient
-from subtitle_files import DEFAULT_TARGET_LANG, output_subtitle_path, sidecar_subtitle_path
+from subtitle_files import DEFAULT_TARGET_LANG, output_subtitle_path, sidecar_subtitle_path, subtitle_suffix
 
 try:
     from google import genai
@@ -139,8 +139,8 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
     # Build work list — only files that have a matching <target_lang>.srt
     files = []
     for video_file in video_files:
-        zh_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file), target_lang)
-        if os.path.exists(zh_srt):
+        target_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file), target_lang)
+        if os.path.exists(target_srt):
             files.append({"name": video_file, "status": "pending"})
         else:
             logger.warning(f"SYNC: No {target_lang}.srt for {video_file}, skipping")
@@ -163,18 +163,17 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
         video_file = file_entry["name"]
         file_entry["status"] = "processing"
 
-        base       = os.path.splitext(video_file)[0]
         video_path = os.path.join(folder_path, video_file)
-        zh_srt     = sidecar_subtitle_path(video_path, target_lang)
-        en_srt     = os.path.join(folder_path, f"{base}.en.srt")
+        target_srt = sidecar_subtitle_path(video_path, target_lang)
+        en_srt     = sidecar_subtitle_path(video_path, "en")
 
         use_srt_ref = (priority in ("srt", "auto")) and os.path.exists(en_srt)
         if use_srt_ref:
-            cmd = ["ffsubsync", en_srt, "-i", zh_srt, "-o", zh_srt, "--srt"]
+            cmd = ["ffsubsync", en_srt, "-i", target_srt, "-o", target_srt, "--srt"]
             file_entry["method"] = "srt"
             logger.info(f"SYNC: SRT-ref mode for {video_file}")
         else:
-            cmd = ["ffsubsync", video_path, "-i", zh_srt, "-o", zh_srt]
+            cmd = ["ffsubsync", video_path, "-i", target_srt, "-o", target_srt]
             file_entry["method"] = "audio"
             logger.info(f"SYNC: Audio-ref mode for {video_file}")
 
@@ -487,9 +486,9 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
             result_text = await generate_with_llama_swap(batch_text, context_text, translator.model, target_lang)
             if result_text is None:
                 if not (translator.gemini_fallback and client is not None):
-                    logger.error(f"Failed chunk {index}: TranslateGemma returned None")
+                    logger.error(f"Failed chunk {index}: {translator.model} returned nothing")
                     return None
-                logger.warning(f"TranslateGemma failed for chunk {index}, falling back to Gemini")
+                logger.warning(f"{translator.model} failed for chunk {index}, falling back to Gemini")
                 result_text = await generate_with_gemini(prompt, GEMINI_MODEL, index)
 
         if result_text:
@@ -504,7 +503,7 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
 async def translate_single_subtitle(en_sub_path: str, translator: Translator | None = None,
                                     target_lang: str = DEFAULT_TARGET_LANG) -> bool:
     """
-    Translate a single subtitle file to Chinese.
+    Translate a single subtitle file to target_lang.
     Returns True if successful, False otherwise.
     """
     translator = translator or default_translator()
@@ -714,7 +713,7 @@ async def shift_subtitle(req: ShiftRequest):
         targets = [req.path]
     # If it's a folder, shift all <target_lang>.srt inside
     else:
-        suffix = f".{req.target_lang}.srt".lower()
+        suffix = subtitle_suffix(req.target_lang).lower()
         targets = [
             os.path.join(req.path, f)
             for f in os.listdir(req.path)
