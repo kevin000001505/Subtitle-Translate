@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+google-genai
+pysubs2
+requests
+httpx
+pytest

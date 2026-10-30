@@ -1,0 +1,332 @@
+import asyncio
+
+import pysubs2
+from fastapi.testclient import TestClient
+
+import main
+from conftest import SAMPLE_SRT
+
+
+def translate(path, **fields):
+    client = TestClient(main.app)
+    return client.post("/translate", json={"path": str(path), **fields})
+
+
+def lines(path):
+    return [(s.start, s.end, s.text) for s in pysubs2.load(str(path))]
+
+
+def test_translating_a_folder_writes_zh_tw_next_to_the_english_subtitle(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert lines(media / "Movie.zh-TW.srt") == [
+        (500, 1500, "zh-TW: Hello"),
+        (2500, 3500, "zh-TW: Goodbye"),
+    ]
+
+
+def test_translating_uses_the_translategemma_model_from_env_by_default(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert [r["json"]["model"] for r in llama.requests] == ["translatemgemma"]
+    assert llama.requests[0]["url"] == "http://localhost:8080/v1/chat/completions"
+
+
+def test_translating_a_single_english_subtitle_file(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media / "Movie.en.srt")
+
+    assert lines(media / "Movie.zh-TW.srt")[0] == (500, 1500, "zh-TW: Hello")
+
+
+def test_an_existing_translation_is_skipped(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.zh-TW.srt").write_text("keep me")
+
+    translate(media)
+
+    assert llama.requests == []
+    assert (media / "Movie.zh-TW.srt").read_text() == "keep me"
+
+
+def test_only_untranslated_episodes_of_a_series_are_translated(media, llama):
+    (media / "S01E01.en.srt").write_text(SAMPLE_SRT)
+    (media / "S01E01.zh-TW.srt").write_text("keep me")
+    (media / "S01E02.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert (media / "S01E01.zh-TW.srt").read_text() == "keep me"
+    assert lines(media / "S01E02.zh-TW.srt")[1] == (2500, 3500, "zh-TW: Goodbye")
+
+
+def test_a_failing_local_model_falls_back_to_gemini_by_default(media, llama, gemini):
+    llama.status_code = 500
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert lines(media / "Movie.zh-TW.srt")[0] == (500, 1500, "gemini: Hello")
+    assert "Translate to zh-TW" in gemini.prompts[0]
+    assert gemini.models_used == ["gemini-2.5-flash-lite"]
+
+
+def run_process_movie(path, **kwargs):
+    asyncio.run(main.process_movie(str(path), **kwargs))
+
+
+def test_translating_to_another_language_writes_that_language_next_to_the_video(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media, target_lang="ja")
+
+    assert (media / "Movie.ja.srt").exists()
+    assert lines(media / "Movie.ja.srt") == [
+        (500, 1500, "ja: Hello"),
+        (2500, 3500, "ja: Goodbye"),
+    ]
+    assert not (media / "Movie.zh-TW.srt").exists()
+
+
+def test_an_existing_translation_in_another_language_does_not_block_translating(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.zh-TW.srt").write_text("keep me")
+
+    run_process_movie(media, target_lang="ja")
+
+    assert (media / "Movie.ja.srt").exists()
+    assert (media / "Movie.zh-TW.srt").read_text() == "keep me"
+
+
+def test_an_existing_translation_in_the_requested_language_is_skipped(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.ja.srt").write_text("keep me")
+
+    run_process_movie(media, target_lang="ja")
+
+    assert llama.requests == []
+    assert (media / "Movie.ja.srt").read_text() == "keep me"
+
+
+def test_translating_a_single_english_subtitle_file_to_another_language(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media / "Movie.en.srt", target_lang="ja")
+
+    assert (media / "Movie.ja.srt").exists()
+    assert lines(media / "Movie.ja.srt")[0] == (500, 1500, "ja: Hello")
+
+
+def test_a_video_without_an_english_srt_is_extracted_and_translated_to_the_requested_language(media, llama, make_mkv):
+    make_mkv(media / "S01E01.mkv")
+    (media / "S01E01.zh-TW.srt").write_text("keep me")
+
+    run_process_movie(media, target_lang="ja")
+
+    assert (media / "S01E01.ja.srt").exists()
+    assert lines(media / "S01E01.ja.srt")[0] == (500, 1500, "ja: Hello")
+
+
+def test_a_chosen_gemini_model_is_asked_for_the_requested_language(media, llama, gemini):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media, target_lang="ja",
+                      translator=main.Translator(backend="gemini", model="gemini-2.5-pro"))
+
+    assert gemini.models_used == ["gemini-2.5-pro"]
+    assert "Translate to ja." in gemini.prompts[0]
+    assert llama.requests == []
+    assert lines(media / "Movie.ja.srt")[0] == (500, 1500, "gemini: Hello")
+
+
+def test_a_single_subtitle_file_already_translated_to_the_requested_language_is_skipped(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.ja.srt").write_text("keep me")
+
+    run_process_movie(media / "Movie.en.srt", target_lang="ja")
+
+    assert llama.requests == []
+    assert (media / "Movie.ja.srt").read_text() == "keep me"
+
+
+def test_the_translate_endpoint_accepts_a_target_language(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media, target_lang="ja")
+
+    assert (media / "Movie.ja.srt").exists()
+
+
+def test_the_translate_endpoint_rejects_a_language_code_that_is_not_a_language(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    response = translate(media, target_lang="zh TW")
+
+    assert response.status_code == 422
+    assert llama.requests == []
+
+
+def test_a_request_queued_at_the_daily_limit_keeps_its_target_language(media, llama, monkeypatch):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    monkeypatch.setattr(main, "DAILY_LIMIT", -1)
+    assert translate(media, target_lang="ja").json()["status"] == "queued_limit_reached"
+    monkeypatch.setattr(main, "DAILY_LIMIT", 9500)
+
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.ja.srt").exists()
+    assert not (media / "Movie.zh-TW.srt").exists()
+
+
+def test_the_same_title_queued_in_two_languages_gets_both(media, llama, monkeypatch):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    monkeypatch.setattr(main, "DAILY_LIMIT", -1)
+    translate(media, target_lang="zh-TW")
+    translate(media, target_lang="ja")
+    monkeypatch.setattr(main, "DAILY_LIMIT", 9500)
+
+    asyncio.run(main.run_next_queued_job())
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.zh-TW.srt").exists()
+    assert (media / "Movie.ja.srt").exists()
+
+
+def test_jobs_queued_before_languages_were_stored_still_run_as_zh_tw(media, llama, tmp_path, monkeypatch):
+    import sqlite3
+    old_db = tmp_path / "old-queue.db"
+    conn = sqlite3.connect(old_db)
+    conn.execute("CREATE TABLE job_queue (id INTEGER PRIMARY KEY, path TEXT, status TEXT, added_at REAL)")
+    conn.execute("INSERT INTO job_queue (path, status, added_at) VALUES (?, 'PENDING', 0)", (str(media),))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(main, "DB_FILE", str(old_db))
+    main.init_db()
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.zh-TW.srt").exists()
+
+
+def test_a_subtitle_queued_mid_job_at_the_daily_limit_keeps_its_target_language(media, llama, monkeypatch):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    monkeypatch.setattr(main, "DAILY_LIMIT", 0)
+    translate(media, target_lang="ja")
+    assert not (media / "Movie.ja.srt").exists()
+    monkeypatch.setattr(main, "DAILY_LIMIT", 9500)
+
+    asyncio.run(main.run_next_queued_job())
+
+    assert (media / "Movie.ja.srt").exists()
+
+
+def test_an_upper_case_EN_subtitle_with_an_existing_translation_is_skipped(media, llama):
+    (media / "Movie.EN.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.zh-TW.srt").write_text("keep me")
+
+    translate(media)
+
+    assert llama.requests == []
+    assert sorted(p.name for p in media.iterdir()) == ["Movie.EN.srt", "Movie.zh-TW.srt"]
+
+
+def test_the_translate_endpoint_rejects_an_over_long_language_code(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    response = translate(media, target_lang="zh" + "-Hant" * 8)
+
+    assert response.status_code == 422
+    assert llama.requests == []
+
+
+def test_gemini_is_the_default_translator_when_configured_and_keyed(media, llama, gemini, monkeypatch):
+    monkeypatch.setattr(main, "TRANSLATOR_BACKEND", "gemini")
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert gemini.models_used == ["gemini-2.5-flash-lite"]
+    assert llama.requests == []
+
+
+def test_a_local_translator_without_fallback_never_calls_gemini(media, llama, gemini):
+    llama.status_code = 500
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media, translator=main.Translator(backend="llama-swap", model="qwen3"))
+
+    assert gemini.prompts == []
+    assert [r["json"]["model"] for r in llama.requests] == ["qwen3"] * 9
+
+
+def test_a_language_code_in_other_letter_case_matches_the_existing_translation(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.zh-TW.srt").write_text("keep me")
+
+    translate(media, target_lang="zh-tw")
+
+    assert llama.requests == []
+    assert sorted(p.name for p in media.iterdir()) == ["Movie.en.srt", "Movie.zh-TW.srt"]
+
+
+def test_a_chosen_gemini_translator_without_an_api_key_writes_nothing(media, llama):
+    assert main.client is None
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media, target_lang="ja",
+                      translator=main.Translator(backend="gemini", model="gemini-2.5-pro"))
+
+    assert not (media / "Movie.ja.srt").exists()
+
+
+def test_a_gemini_default_without_an_api_key_still_translates_locally(media, llama, monkeypatch):
+    assert main.client is None
+    monkeypatch.setattr(main, "TRANSLATOR_BACKEND", "gemini")
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert [r["json"]["model"] for r in llama.requests] == ["translatemgemma"]
+    assert lines(media / "Movie.zh-TW.srt")[0] == (500, 1500, "zh-TW: Hello")
+
+
+def test_only_english_subtitles_in_a_folder_are_translated(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.fr.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert sorted(p.name for p in media.iterdir()) == ["Movie.en.srt", "Movie.fr.srt", "Movie.zh-TW.srt"]
+
+
+def test_a_single_english_subtitle_path_translates_that_file_not_its_neighbour(media, llama):
+    (media / "A.en.srt").write_text(SAMPLE_SRT)
+    (media / "B.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media / "B.en.srt")
+    translate(media / "A.en.srt")
+
+    assert sorted(p.name for p in media.iterdir()) == ["A.en.srt", "A.zh-TW.srt", "B.en.srt", "B.zh-TW.srt"]
+
+
+def test_a_video_path_uses_an_english_subtitle_in_its_folder(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.mkv").write_bytes(b"")
+
+    translate(media / "Movie.mkv")
+
+    assert (media / "Movie.zh-TW.srt").exists()
+
+
+def test_translategemma_is_told_the_source_is_english(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert llama.requests[0]["json"]["messages"][0]["content"][0]["source_lang_code"] == "en"

@@ -1,9 +1,20 @@
 services:
   backend:
     build: .
+    # Every value comes from .env (see .env.example); the defaults match the code's.
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+      - TRANSLATOR_BACKEND=${TRANSLATOR_BACKEND:-translatemgemma}
+      - TRANSLATE_GEMMA_URL=${TRANSLATE_GEMMA_URL:-http://localhost:8080}
+      - TRANSLATE_GEMMA_MODEL=${TRANSLATE_GEMMA_MODEL:-translatemgemma}
+      - TRANSLATE_GEMMA_API_KEY=${TRANSLATE_GEMMA_API_KEY:-random_key}
+      - JELLYFIN_URL=${JELLYFIN_URL:-}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
+      - JELLYFIN_PATH_MAP=${JELLYFIN_PATH_MAP:-}
+      - PLEX_URL=${PLEX_URL:-}
+      - PLEX_TOKEN=${PLEX_TOKEN:-}
+      - PLEX_PATH_MAP=${PLEX_PATH_MAP:-}
     volumes:
       - ${MEDIA}/media:/media
       - ./queue_data:/app/data

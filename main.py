@@ -1,7 +1,8 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel, Field
+from typing import Annotated
 import uvicorn
 import os
 import pysubs2
@@ -14,7 +15,11 @@ import json
 import uuid
 import subprocess
 from contextlib import asynccontextmanager
-from translate_gemma import TranslateGemmaClient
+from dataclasses import dataclass
+from translate_gemma import TRANSLATE_GEMMA_MODEL, TranslateGemmaClient
+from subtitle_files import (DEFAULT_TARGET_LANG, SOURCE_LANG, canonical_lang, is_source_subtitle,
+                            output_subtitle_path, sidecar_subtitle_path, strip_source_suffix,
+                            subtitle_suffix)
 
 try:
     from google import genai
@@ -22,7 +27,6 @@ except ImportError:
     genai = None
 
 # ================= CONFIGURATION =================
-TARGET_LANG = "zh-TW"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
@@ -32,8 +36,27 @@ client = genai.Client(api_key=GEMINI_API_KEY) if (GEMINI_API_KEY and genai) else
 # TranslateGemma (local llama.cpp server)
 translate_gemma_client = TranslateGemmaClient()
 
-# Which translator to use: "translatemgemma" or "gemini"
+# Which translator to use by default: "translatemgemma" or "gemini"
 TRANSLATOR_BACKEND = os.getenv("TRANSLATOR_BACKEND", "translatemgemma")
+
+
+@dataclass(frozen=True)
+class Translator:
+    """Which model translates a subtitle.
+
+    backend is "llama-swap" (a local model behind the OpenAI-compatible API)
+    or "gemini"; model is that backend's model id. gemini_fallback retries a
+    failed local chunk on Gemini."""
+    backend: str
+    model: str
+    gemini_fallback: bool = False
+
+
+def default_translator() -> Translator:
+    """The translator the app used before it could be chosen per request."""
+    if TRANSLATOR_BACKEND == "gemini" and client is not None:
+        return Translator(backend="gemini", model=GEMINI_MODEL)
+    return Translator(backend="llama-swap", model=TRANSLATE_GEMMA_MODEL, gemini_fallback=True)
 
 # --- PLAYBACK SYNC CONTROL ---
 # Set to -1000 to show Chinese subtitles 1 second EARLIER.
@@ -54,16 +77,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("SubtitleAPI")
 sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
+# A BCP-47 style code such as "ja" or "zh-TW". It becomes part of the
+# subtitle file name, so anything else (spaces, slashes, dots) is refused,
+# and it is capped at the 35 characters RFC 5646 asks tags to fit in. Casing
+# is normalised so "zh-tw" finds an existing "zh-TW" subtitle.
+LangCode = Annotated[str, Field(pattern=r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$", max_length=35),
+                     AfterValidator(canonical_lang)]
+
 class SubtitleRequest(BaseModel):
     path: str
+    target_lang: LangCode = DEFAULT_TARGET_LANG
 
 class ShiftRequest(BaseModel):
     path: str  # can be a file or folder
     offset_ms: int = 0
+    target_lang: LangCode = DEFAULT_TARGET_LANG
 
 class SyncRequest(BaseModel):
     path: str  # folder path
     priority: str = "auto"  # "srt", "audio", or "auto"
+    target_lang: LangCode = DEFAULT_TARGET_LANG
 
 
 
@@ -84,7 +117,8 @@ def _prune_sync_jobs():
         sync_jobs.pop(jid, None)
 
 
-async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: str):
+async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: str,
+                                     target_lang: str = DEFAULT_TARGET_LANG):
     """
     Run ffsubsync for all matching files in folder_path, updating sync_jobs[job_id]
     with per-file progress as each file completes.
@@ -106,19 +140,18 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
         job["finished_at"] = time.time()
         return
 
-    # Build work list — only files that have a matching zh-TW.srt
+    # Build work list — only files that have a matching <target_lang>.srt
     files = []
     for video_file in video_files:
-        base   = os.path.splitext(video_file)[0]
-        zh_srt = os.path.join(folder_path, f"{base}.zh-TW.srt")
-        if os.path.exists(zh_srt):
+        target_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file), target_lang)
+        if os.path.exists(target_srt):
             files.append({"name": video_file, "status": "pending"})
         else:
-            logger.warning(f"SYNC: No zh-TW.srt for {video_file}, skipping")
+            logger.warning(f"SYNC: No {target_lang}.srt for {video_file}, skipping")
 
     if not files:
         job["status"]      = "error"
-        job["message"]     = "No zh-TW.srt files found to sync"
+        job["message"]     = f"No {target_lang}.srt files found to sync"
         job["finished_at"] = time.time()
         return
 
@@ -134,18 +167,17 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
         video_file = file_entry["name"]
         file_entry["status"] = "processing"
 
-        base       = os.path.splitext(video_file)[0]
         video_path = os.path.join(folder_path, video_file)
-        zh_srt     = os.path.join(folder_path, f"{base}.zh-TW.srt")
-        en_srt     = os.path.join(folder_path, f"{base}.en.srt")
+        target_srt = sidecar_subtitle_path(video_path, target_lang)
+        en_srt     = sidecar_subtitle_path(video_path, SOURCE_LANG)
 
         use_srt_ref = (priority in ("srt", "auto")) and os.path.exists(en_srt)
         if use_srt_ref:
-            cmd = ["ffsubsync", en_srt, "-i", zh_srt, "-o", zh_srt, "--srt"]
+            cmd = ["ffsubsync", en_srt, "-i", target_srt, "-o", target_srt, "--srt"]
             file_entry["method"] = "srt"
             logger.info(f"SYNC: SRT-ref mode for {video_file}")
         else:
-            cmd = ["ffsubsync", video_path, "-i", zh_srt, "-o", zh_srt]
+            cmd = ["ffsubsync", video_path, "-i", target_srt, "-o", target_srt]
             file_entry["method"] = "audio"
             logger.info(f"SYNC: Audio-ref mode for {video_file}")
 
@@ -204,6 +236,9 @@ def init_db():
                  (id INTEGER PRIMARY KEY, path TEXT, status TEXT, added_at REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS history
                  (id INTEGER PRIMARY KEY, path TEXT, operation TEXT, timestamp REAL)''')
+    queue_columns = [row[1] for row in c.execute("PRAGMA table_info(job_queue)")]
+    if "target_lang" not in queue_columns:
+        c.execute(f"ALTER TABLE job_queue ADD COLUMN target_lang TEXT NOT NULL DEFAULT '{DEFAULT_TARGET_LANG}'")
     conn.commit()
     conn.close()
 
@@ -228,12 +263,14 @@ def get_calls_last_24h():
     conn.close()
     return count
 
-def add_to_queue(path):
+def add_to_queue(path, target_lang=DEFAULT_TARGET_LANG):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id FROM job_queue WHERE path = ? AND status = 'PENDING'", (path,))
+    c.execute("SELECT id FROM job_queue WHERE path = ? AND target_lang = ? AND status = 'PENDING'",
+              (path, target_lang))
     if c.fetchone() is None:
-        c.execute("INSERT INTO job_queue (path, status, added_at) VALUES (?, 'PENDING', ?)", (path, time.time()))
+        c.execute("INSERT INTO job_queue (path, status, added_at, target_lang) VALUES (?, 'PENDING', ?, ?)",
+                  (path, time.time(), target_lang))
         conn.commit()
         logger.info(f"QUEUE: Added {path} to queue.")
     conn.close()
@@ -241,20 +278,20 @@ def add_to_queue(path):
 def pop_from_queue():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, path FROM job_queue WHERE status = 'PENDING' ORDER BY added_at ASC LIMIT 1")
+    c.execute("SELECT id, path, target_lang FROM job_queue WHERE status = 'PENDING' ORDER BY added_at ASC LIMIT 1")
     row = c.fetchone()
     if row:
         c.execute("UPDATE job_queue SET status = 'PROCESSING' WHERE id = ?", (row[0],))
         conn.commit()
         conn.close()
-        return row[1]
+        return row[1], row[2]
     conn.close()
     return None
 
-def mark_done_in_queue(path):
+def mark_done_in_queue(path, target_lang=DEFAULT_TARGET_LANG):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("DELETE FROM job_queue WHERE path = ?", (path,))
+    c.execute("DELETE FROM job_queue WHERE path = ? AND target_lang = ?", (path, target_lang))
     conn.commit()
     conn.close()
 
@@ -337,8 +374,7 @@ async def extract_english_sub_from_mkv(mkv_path: str) -> str | None:
 
         # Extract to .en.srt
         stream_index = eng_stream["index"]
-        base_name = os.path.splitext(mkv_path)[0]
-        out_srt = f"{base_name}.en.srt"
+        out_srt = sidecar_subtitle_path(mkv_path, SOURCE_LANG)
 
         extract_cmd = [
             "ffmpeg", "-v", "quiet", "-i", mkv_path,
@@ -366,7 +402,7 @@ async def find_or_extract_english_sub(folder: str) -> str | None:
     """
     # 1. Check for existing .en.srt
     for f in os.listdir(folder):
-        if f.lower().endswith(".en.srt"):
+        if is_source_subtitle(f):
             logger.info(f"EXTRACT: Found existing English sub: {f}")
             return os.path.join(folder, f)
 
@@ -409,13 +445,34 @@ def parse_gemini_response(response_text):
         updates[sub_id] = text
     return updates
 
-async def process_single_chunk(index, batch, context_text, total_chunks, progress_counter):
+async def generate_with_gemini(prompt, model, index):
+    for attempt in range(3):
+        try:
+            response = await client.aio.models.generate_content(model=model, contents=prompt)
+            log_api_call()
+            return response.text
+        except Exception as e:
+            if attempt == 2:
+                logger.error(f"Failed chunk {index} (gemini): {e}")
+                return None
+            await asyncio.sleep((attempt + 1) * 2)
+
+async def generate_with_llama_swap(batch_text, context_text, model, target_lang):
+    for attempt in range(3):
+        result_text = await translate_gemma_client.translate(batch_text, context_text, model, target_lang)
+        if result_text is not None:
+            return result_text
+        if attempt < 2:
+            await asyncio.sleep((attempt + 1) * 2)
+    return None
+
+async def process_single_chunk(index, batch, context_text, total_chunks, progress_counter, translator, target_lang):
     async with sem: 
         batch_text = "\n".join([f"[{idx}] {sub.text}" for idx, sub in batch])
         
         prompt = f"""
         CONTEXT: The movie is about: {context_text[:2000]}...
-        TASK: Translate to {TARGET_LANG}.
+        TASK: Translate to {target_lang}.
         
         CRITICAL RULES:
         1. Format MUST be: [ID] Translated Text
@@ -426,56 +483,16 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
         {batch_text}
         """
 
-        gemini_fallback_used = False
-        result_text = None
-
-        # Primary translator (TranslateGemma or Gemini based on config)
-        if TRANSLATOR_BACKEND == "gemini" and client is not None:
-            for attempt in range(3):
-                try:
-                    response = await client.aio.models.generate_content(
-                        model=GEMINI_MODEL, contents=prompt
-                    )
-                    log_api_call()
-                    result_text = response.text
-                    break
-                except Exception as e:
-                    wait_time = (attempt + 1) * 2
-                    if attempt == 2:
-                        logger.error(f"Failed chunk {index}: {e}")
-                        return None
-                    await asyncio.sleep(wait_time)
+        if translator.backend == "gemini":
+            result_text = await generate_with_gemini(prompt, translator.model, index)
         else:
-            for attempt in range(3):
-                try:
-                    result_text = await translate_gemma_client.translate(batch_text, context_text)
-                    if result_text is None:
-                        raise Exception("TranslateGemma returned None")
-                    break
-                except Exception as e:
-                    wait_time = (attempt + 1) * 2
-                    if attempt == 2:
-                        if client is not None:
-                            gemini_fallback_used = True
-                            logger.warning(f"TranslateGemma failed for chunk {index}, falling back to Gemini: {e}")
-                            for g_attempt in range(3):
-                                try:
-                                    response = await client.aio.models.generate_content(
-                                        model=GEMINI_MODEL, contents=prompt
-                                    )
-                                    log_api_call()
-                                    result_text = response.text
-                                    break
-                                except Exception as g_e:
-                                    g_wait = (g_attempt + 1) * 2
-                                    if g_attempt == 2:
-                                        logger.error(f"Failed chunk {index} (gemini fallback): {g_e}")
-                                        return None
-                                    await asyncio.sleep(g_wait)
-                            break
-                        logger.error(f"Failed chunk {index}: {e}")
-                        return None
-                    await asyncio.sleep(wait_time)
+            result_text = await generate_with_llama_swap(batch_text, context_text, translator.model, target_lang)
+            if result_text is None:
+                if not (translator.gemini_fallback and client is not None):
+                    logger.error(f"Failed chunk {index}: {translator.model} returned nothing")
+                    return None
+                logger.warning(f"{translator.model} failed for chunk {index}, falling back to Gemini")
+                result_text = await generate_with_gemini(prompt, GEMINI_MODEL, index)
 
         if result_text:
             progress_counter['completed'] += 1
@@ -486,11 +503,16 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
 
         return result_text
 
-async def translate_single_subtitle(en_sub_path: str) -> bool:
+async def translate_single_subtitle(en_sub_path: str, translator: Translator | None = None,
+                                    target_lang: str = DEFAULT_TARGET_LANG) -> bool:
     """
-    Translate a single subtitle file to Chinese.
+    Translate a single subtitle file to target_lang.
     Returns True if successful, False otherwise.
     """
+    translator = translator or default_translator()
+    if translator.backend == "gemini" and client is None:
+        logger.error(f"Cannot translate {en_sub_path} with {translator.model}: GEMINI_API_KEY is not set")
+        return False
     logger.info(f"START: Processing {en_sub_path}")
 
     try:
@@ -505,7 +527,7 @@ async def translate_single_subtitle(en_sub_path: str) -> bool:
     used_today = get_calls_last_24h()
     if (used_today + total_chunks) > DAILY_LIMIT:
         logger.warning(f"LIMIT HIT: Queueing {en_sub_path}")
-        add_to_queue(en_sub_path)
+        add_to_queue(en_sub_path, target_lang)
         return False
 
     logger.info(f"Translating {total_chunks} chunks (Concurrency: {CONCURRENCY_LIMIT})...")
@@ -515,7 +537,7 @@ async def translate_single_subtitle(en_sub_path: str) -> bool:
     progress_counter = {'completed': 0}
     
     for i, batch in enumerate(chunks):
-        task = process_single_chunk(i, batch, full_text_preview, total_chunks, progress_counter)
+        task = process_single_chunk(i, batch, full_text_preview, total_chunks, progress_counter, translator, target_lang)
         tasks.append(task)
 
     results = await asyncio.gather(*tasks)
@@ -541,14 +563,7 @@ async def translate_single_subtitle(en_sub_path: str) -> bool:
         logger.info(f"Applied {TIME_OFFSET_MS}ms offset to all {len(subs)} subtitles.")
 
     # Save
-    if en_sub_path.endswith(".en.srt"):
-        new_path = en_sub_path.replace(".en.srt", ".zh-TW.srt")
-    elif en_sub_path.endswith(".srt"):
-        base_name = en_sub_path[:-4]
-        new_path = f"{base_name}(AI).zh-TW.srt"
-    else:
-        new_path = en_sub_path + ".zh-TW.srt"
-        
+    new_path = output_subtitle_path(en_sub_path, target_lang)
     await asyncio.to_thread(subs.save, new_path, encoding="utf-8")
 
     try:
@@ -561,7 +576,7 @@ async def translate_single_subtitle(en_sub_path: str) -> bool:
     logger.info(f"DONE: Saved {new_path}")
     return True
 
-async def process_movie(input_path: str):
+async def process_movie(input_path: str, translator: Translator | None = None, target_lang: str = DEFAULT_TARGET_LANG):
     """
     Main entry point. Handles both single files and series folders.
     - If input_path is a file: translate its subtitle
@@ -569,7 +584,7 @@ async def process_movie(input_path: str):
     """
     if not os.path.exists(input_path):
         logger.error(f"Path not found: {input_path}")
-        mark_done_in_queue(input_path)
+        mark_done_in_queue(input_path, target_lang)
         return
 
     # Check if input is a folder (series) or file
@@ -578,11 +593,11 @@ async def process_movie(input_path: str):
         movie_dir = input_path
 
         # Find all .en.srt, MKV, and MP4 files in the folder
-        srt_files   = [f for f in os.listdir(movie_dir) if f.lower().endswith(".en.srt")]
+        srt_files   = [f for f in os.listdir(movie_dir) if is_source_subtitle(f)]
         video_files = [f for f in os.listdir(movie_dir) if f.lower().endswith((".mkv", ".mp4"))]
         if not srt_files and not video_files:
             logger.warning(f"SKIP: No .en.srt or MKV/MP4 files found in {movie_dir}")
-            mark_done_in_queue(input_path)
+            mark_done_in_queue(input_path, target_lang)
             return
 
         logger.info(f"SERIES: Found {len(srt_files)} .en.srt and {len(video_files)} video file(s).")
@@ -590,25 +605,25 @@ async def process_movie(input_path: str):
         # Process existing .en.srt files — skip individual episodes already translated
         processed_bases = set()
         for srt_file in sorted(srt_files):
-            base     = srt_file[:-len(".en.srt")]
-            zh_path  = os.path.join(movie_dir, f"{base}.zh-TW.srt")
-            if os.path.exists(zh_path):
-                logger.info(f"EPISODE: Skipping {srt_file}, zh-TW.srt already exists.")
+            base     = strip_source_suffix(srt_file)
+            srt_path = os.path.join(movie_dir, srt_file)
+            out_path = output_subtitle_path(srt_path, target_lang)
+            if os.path.exists(out_path):
+                logger.info(f"EPISODE: Skipping {srt_file}, {os.path.basename(out_path)} already exists.")
                 processed_bases.add(base.lower())
                 continue
-            srt_path = os.path.join(movie_dir, srt_file)
             processed_bases.add(base.lower())
             logger.info(f"EPISODE: Translating {srt_file}")
-            success = await translate_single_subtitle(srt_path)
+            success = await translate_single_subtitle(srt_path, translator, target_lang)
             if not success:
                 logger.warning(f"EPISODE: Failed to translate {srt_path}")
 
         # Process video files whose translation doesn't exist yet
         for video_file in sorted(video_files):
             base    = os.path.splitext(video_file)[0]
-            zh_path = os.path.join(movie_dir, f"{base}.zh-TW.srt")
-            if os.path.exists(zh_path):
-                logger.info(f"EPISODE: Skipping {video_file}, zh-TW.srt already exists.")
+            out_path = sidecar_subtitle_path(os.path.join(movie_dir, video_file), target_lang)
+            if os.path.exists(out_path):
+                logger.info(f"EPISODE: Skipping {video_file}, {os.path.basename(out_path)} already exists.")
                 continue
             if base.lower() in processed_bases:
                 logger.info(f"EPISODE: Skipping {video_file}, .en.srt already processed.")
@@ -619,55 +634,53 @@ async def process_movie(input_path: str):
             if en_sub_path is None:
                 logger.warning(f"EPISODE: Could not extract subtitle from {video_file}")
                 continue
-            success = await translate_single_subtitle(en_sub_path)
+            success = await translate_single_subtitle(en_sub_path, translator, target_lang)
             if not success:
                 logger.warning(f"EPISODE: Failed to translate {en_sub_path}")
 
         logger.info(f"SERIES: Completed {movie_dir}")
         log_history(input_path, "translate")
-        mark_done_in_queue(input_path)
+        mark_done_in_queue(input_path, target_lang)
     else:
         # Single file mode — resolve to an .en.srt and translate it
         movie_dir = os.path.dirname(input_path)
 
-        if input_path.lower().endswith(".en.srt"):
+        if is_source_subtitle(input_path):
             en_sub_path = input_path
         else:
             en_sub_path = await find_or_extract_english_sub(movie_dir)
 
         if en_sub_path is None:
             logger.warning(f"SKIP: Could not find or extract an English subtitle in {movie_dir}")
-            mark_done_in_queue(input_path)
+            mark_done_in_queue(input_path, target_lang)
             return
 
-        # Skip if zh-TW already exists for this specific file.
-        # Must match the save-path logic in translate_single_subtitle.
-        if en_sub_path.endswith(".en.srt"):
-            zh_path = en_sub_path.replace(".en.srt", ".zh-TW.srt")
-        elif en_sub_path.endswith(".srt"):
-            zh_path = f"{en_sub_path[:-4]}(AI).zh-TW.srt"
-        else:
-            zh_path = en_sub_path + ".zh-TW.srt"
-        if os.path.exists(zh_path):
-            logger.info(f"SKIP: {zh_path} already exists.")
-            mark_done_in_queue(input_path)
+        # Skip if the translation already exists for this specific file.
+        out_path = output_subtitle_path(en_sub_path, target_lang)
+        if os.path.exists(out_path):
+            logger.info(f"SKIP: {out_path} already exists.")
+            mark_done_in_queue(input_path, target_lang)
             return
 
-        success = await translate_single_subtitle(en_sub_path)
+        success = await translate_single_subtitle(en_sub_path, translator, target_lang)
         if success:
             log_history(input_path, "translate")
-        mark_done_in_queue(input_path)
+        mark_done_in_queue(input_path, target_lang)
 
 # ================= SCHEDULER & APP =================
 
+async def run_next_queued_job():
+    used = get_calls_last_24h()
+    if (DAILY_LIMIT - used) > 100:
+        next_job = pop_from_queue()
+        if next_job:
+            next_file, target_lang = next_job
+            logger.info(f"MONITOR: Starting queued job: {next_file} ({target_lang})")
+            await process_movie(next_file, target_lang=target_lang)
+
 async def queue_monitor():
     while True:
-        used = get_calls_last_24h()
-        if (DAILY_LIMIT - used) > 100:
-            next_file = pop_from_queue()
-            if next_file:
-                logger.info(f"MONITOR: Starting queued job: {next_file}")
-                await process_movie(next_file)
+        await run_next_queued_job()
         await asyncio.sleep(3600)
 
 @asynccontextmanager
@@ -690,10 +703,10 @@ app.add_middleware(
 async def trigger_translation(req: SubtitleRequest, background_tasks: BackgroundTasks):
     used = get_calls_last_24h()
     if used > DAILY_LIMIT:
-        add_to_queue(req.path)
+        add_to_queue(req.path, req.target_lang)
         return {"status": "queued_limit_reached", "message": "Daily limit reached — queued"}
 
-    background_tasks.add_task(process_movie, req.path)
+    background_tasks.add_task(process_movie, req.path, target_lang=req.target_lang)
     return {"status": "processing_async", "message": "Translation started in background"}
 
 @app.post("/shift")
@@ -704,16 +717,17 @@ async def shift_subtitle(req: ShiftRequest):
     # If it's a file, shift just that file
     if os.path.isfile(req.path):
         targets = [req.path]
-    # If it's a folder, shift all zh-TW.srt inside
+    # If it's a folder, shift all <target_lang>.srt inside
     else:
+        suffix = subtitle_suffix(req.target_lang).lower()
         targets = [
             os.path.join(req.path, f)
             for f in os.listdir(req.path)
-            if f.lower().endswith(".zh-tw.srt")
+            if f.lower().endswith(suffix)
         ]
 
     if not targets:
-        return {"status": "error", "message": "No zh-TW.srt files found"}
+        return {"status": "error", "message": f"No {req.target_lang}.srt files found"}
 
     shifted = []
     failed = []
@@ -754,7 +768,7 @@ async def sync_folder(req: SyncRequest, background_tasks: BackgroundTasks):
         "files":   [],
     }
     logger.info(f"SYNC: Queued job {job_id} for {req.path} (priority={req.priority})")
-    background_tasks.add_task(run_ffsubsync_with_progress, job_id, req.path, req.priority)
+    background_tasks.add_task(run_ffsubsync_with_progress, job_id, req.path, req.priority, req.target_lang)
     return {"job_id": job_id, "status": "started"}
 
 
