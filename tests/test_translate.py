@@ -1,0 +1,74 @@
+import pysubs2
+from fastapi.testclient import TestClient
+
+import main
+from conftest import SAMPLE_SRT
+
+
+def translate(path, **fields):
+    client = TestClient(main.app)
+    return client.post("/translate", json={"path": str(path), **fields})
+
+
+def lines(path):
+    return [(s.start, s.end, s.text) for s in pysubs2.load(str(path))]
+
+
+def test_translating_a_folder_writes_zh_tw_next_to_the_english_subtitle(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert lines(media / "Movie.zh-TW.srt") == [
+        (500, 1500, "zh-TW: Hello"),
+        (2500, 3500, "zh-TW: Goodbye"),
+    ]
+
+
+def test_translating_uses_the_translategemma_model_from_env_by_default(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert [r["json"]["model"] for r in llama.requests] == ["translatemgemma"]
+    assert llama.requests[0]["url"] == "http://localhost:8080/v1/chat/completions"
+
+
+def test_translating_a_single_english_subtitle_file(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media / "Movie.en.srt")
+
+    assert lines(media / "Movie.zh-TW.srt")[0] == (500, 1500, "zh-TW: Hello")
+
+
+def test_an_existing_translation_is_skipped(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    (media / "Movie.zh-TW.srt").write_text("keep me")
+
+    translate(media)
+
+    assert llama.requests == []
+    assert (media / "Movie.zh-TW.srt").read_text() == "keep me"
+
+
+def test_only_untranslated_episodes_of_a_series_are_translated(media, llama):
+    (media / "S01E01.en.srt").write_text(SAMPLE_SRT)
+    (media / "S01E01.zh-TW.srt").write_text("keep me")
+    (media / "S01E02.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert (media / "S01E01.zh-TW.srt").read_text() == "keep me"
+    assert lines(media / "S01E02.zh-TW.srt")[1] == (2500, 3500, "zh-TW: Goodbye")
+
+
+def test_a_failing_local_model_falls_back_to_gemini_by_default(media, llama, gemini):
+    llama.status_code = 500
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    translate(media)
+
+    assert lines(media / "Movie.zh-TW.srt")[0] == (500, 1500, "gemini: Hello")
+    assert "Translate to zh-TW" in gemini.prompts[0]
+    assert gemini.models_used == ["gemini-2.5-flash-lite"]
