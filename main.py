@@ -80,10 +80,12 @@ class SubtitleRequest(BaseModel):
 class ShiftRequest(BaseModel):
     path: str  # can be a file or folder
     offset_ms: int = 0
+    target_lang: str = DEFAULT_TARGET_LANG
 
 class SyncRequest(BaseModel):
     path: str  # folder path
     priority: str = "auto"  # "srt", "audio", or "auto"
+    target_lang: str = DEFAULT_TARGET_LANG
 
 
 
@@ -104,7 +106,8 @@ def _prune_sync_jobs():
         sync_jobs.pop(jid, None)
 
 
-async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: str):
+async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: str,
+                                     target_lang: str = DEFAULT_TARGET_LANG):
     """
     Run ffsubsync for all matching files in folder_path, updating sync_jobs[job_id]
     with per-file progress as each file completes.
@@ -126,18 +129,18 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
         job["finished_at"] = time.time()
         return
 
-    # Build work list — only files that have a matching zh-TW.srt
+    # Build work list — only files that have a matching <target_lang>.srt
     files = []
     for video_file in video_files:
-        zh_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file))
+        zh_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file), target_lang)
         if os.path.exists(zh_srt):
             files.append({"name": video_file, "status": "pending"})
         else:
-            logger.warning(f"SYNC: No zh-TW.srt for {video_file}, skipping")
+            logger.warning(f"SYNC: No {target_lang}.srt for {video_file}, skipping")
 
     if not files:
         job["status"]      = "error"
-        job["message"]     = "No zh-TW.srt files found to sync"
+        job["message"]     = f"No {target_lang}.srt files found to sync"
         job["finished_at"] = time.time()
         return
 
@@ -155,7 +158,7 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
 
         base       = os.path.splitext(video_file)[0]
         video_path = os.path.join(folder_path, video_file)
-        zh_srt     = sidecar_subtitle_path(video_path)
+        zh_srt     = sidecar_subtitle_path(video_path, target_lang)
         en_srt     = os.path.join(folder_path, f"{base}.en.srt")
 
         use_srt_ref = (priority in ("srt", "auto")) and os.path.exists(en_srt)
@@ -693,16 +696,17 @@ async def shift_subtitle(req: ShiftRequest):
     # If it's a file, shift just that file
     if os.path.isfile(req.path):
         targets = [req.path]
-    # If it's a folder, shift all zh-TW.srt inside
+    # If it's a folder, shift all <target_lang>.srt inside
     else:
+        suffix = f".{req.target_lang}.srt".lower()
         targets = [
             os.path.join(req.path, f)
             for f in os.listdir(req.path)
-            if f.lower().endswith(".zh-tw.srt")
+            if f.lower().endswith(suffix)
         ]
 
     if not targets:
-        return {"status": "error", "message": "No zh-TW.srt files found"}
+        return {"status": "error", "message": f"No {req.target_lang}.srt files found"}
 
     shifted = []
     failed = []
@@ -743,7 +747,7 @@ async def sync_folder(req: SyncRequest, background_tasks: BackgroundTasks):
         "files":   [],
     }
     logger.info(f"SYNC: Queued job {job_id} for {req.path} (priority={req.priority})")
-    background_tasks.add_task(run_ffsubsync_with_progress, job_id, req.path, req.priority)
+    background_tasks.add_task(run_ffsubsync_with_progress, job_id, req.path, req.priority, req.target_lang)
     return {"job_id": job_id, "status": "started"}
 
 
