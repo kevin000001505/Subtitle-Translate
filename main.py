@@ -581,16 +581,19 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
 
     results = await asyncio.gather(*tasks)
 
-    # A reply may only touch its own chunk's lines; it counts as a full
-    # translation only when it has exactly those [ID]s (not merged, not
-    # renumbered from 1). The legacy path still saves partial chunks.
+    # A reply may only touch its own chunk's lines. It counts as a full
+    # translation only when every cue with English text gets non-empty text
+    # (not merged, not blanked, not renumbered from 1); cues that are empty
+    # in English may be left out. The legacy path still saves partial chunks.
     usable = []
     for batch, raw_text in zip(chunks, results):
         ids = {idx for idx, _ in batch}
+        needed = {idx for idx, sub in batch if sub.text.strip()}
         parsed = parse_gemini_response(raw_text) if raw_text else {}
         outcome.unanswered_chunks += not raw_text
         usable.append({i: t for i, t in parsed.items() if i in ids})
-        if set(parsed) != ids:
+        translated = {i for i, t in parsed.items() if t.strip()}
+        if not needed <= translated:
             outcome.failed_chunks += 1
     outcome.total_chunks = total_chunks
     if require_all and outcome.failed_chunks:
@@ -869,7 +872,7 @@ job_wakeup = asyncio.Event()
 # the library stays responsive while a translation fills the default pool;
 # posters get a separate pool so a slow server's posters can't starve them.
 LOOKUP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lookup")
-MODELS_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="models")
+MODELS_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="models")
 POSTER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poster")
 GEMINI_RETRY_SECONDS = 600
 _gemini_blocked_until = 0.0
@@ -907,8 +910,10 @@ async def run_translate_job(job, report) -> tuple[str, str]:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
     if outcome.unanswered_chunks:
+        unusable = outcome.failed_chunks - outcome.unanswered_chunks
+        also = f"; {unusable} more came back with missing or no usable lines" if unusable else ""
         return "failed", (f"{job['model']} did not answer {outcome.unanswered_chunks} of {outcome.total_chunks} "
-                          f"chunks; nothing was saved, so it can be retried")
+                          f"chunks{also}; nothing was saved, so it can be retried")
     if outcome.failed_chunks:
         return "failed", (f"{outcome.failed_chunks} of {outcome.total_chunks} chunks came back with missing or "
                           f"no usable lines from {job['model']}; nothing was saved, so it can be retried")
@@ -946,6 +951,8 @@ async def run_next_job() -> bool:
     was runnable. Gemini jobs wait while the daily limit is (nearly) used up."""
     gemini_waits = time.time() < _gemini_blocked_until or (DAILY_LIMIT - get_calls_last_24h()) <= LIMIT_HEADROOM
     skip = ("gemini",) if gemini_waits else ()
+    if gemini_waits:
+        jobs.note_waiting(DB_FILE, "gemini", "Waiting for Gemini's daily limit")
     job = jobs.claim_next(DB_FILE, skip)
     if job is None:
         return False

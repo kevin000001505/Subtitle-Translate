@@ -285,7 +285,7 @@ async function openShow(t) {
     whole.onchange = () => {
         toggleSelection({ kind: 'show', id: t.id, label: t.name }, whole.checked);
         if (whole.checked) clearEpisodesOf(t.id);
-        renderSeasons(state.show.seasons || []);
+        if (state.show.seasons) renderSeasons(state.show.seasons);   // keep the load error visible
         syncCard(t);
     };
     $('show-dialog').showModal();

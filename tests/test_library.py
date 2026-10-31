@@ -573,3 +573,74 @@ def test_a_model_that_never_answers_is_named_as_unreachable(library, llama):
 
     message = library.client.get("/jobs").json()["jobs"][0]["message"]
     assert "did not answer" in message and "qwen3-14b" in message
+
+
+FIVE_CUES_WITH_EMPTY = """1
+00:00:01,000 --> 00:00:02,000
+Alpha
+
+2
+00:00:02,500 --> 00:00:03,000
+
+
+3
+00:00:03,500 --> 00:00:04,000
+Bravo
+"""
+
+
+def test_a_blank_translation_of_a_real_line_fails_the_job(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: Goodbye", ""))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_reply_that_leaves_out_empty_cues_still_translates(library, llama, monkeypatch):
+    import re
+    reply_with(monkeypatch, llama, lambda text: re.sub(r"\[1\] zh-TW: \n?", "", text))
+    (library.movie / "Arrival.en.srt").write_text(FIVE_CUES_WITH_EMPTY)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    import pysubs2
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+    assert [s.text for s in pysubs2.load(str(library.movie / "Arrival.zh-TW.srt"))] == \
+        ["zh-TW: Alpha", "", "zh-TW: Bravo"]
+
+
+def test_unanswered_and_unusable_chunks_are_both_reported(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+    three = "".join(f"{i + 1}\n00:{i:02d}:00,000 --> 00:{i:02d}:01,000\nLine {i}\n\n" for i in range(3))
+    (library.movie / "Arrival.en.srt").write_text(three)
+
+    def mixed(url, headers=None, json=None, timeout=None):
+        batch = json["messages"][0]["content"][0]["text"].split("INPUT:")[1]
+        if "Line 1" in batch:
+            llama.status_code = 500
+            try:
+                return original(url, headers=headers, json=json, timeout=timeout)
+            finally:
+                llama.status_code = 200
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        if "Line 2" in batch:
+            response._content = "no ids here"
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", mixed)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "did not answer 1 of 3" in message and "1 more came back" in message
+
+
+def test_gemini_jobs_held_back_by_the_limit_say_why(library, gemini, monkeypatch):
+    monkeypatch.setattr(main, "get_calls_last_24h", lambda: main.DAILY_LIMIT)
+    queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
+    asyncio.run(main.run_next_job())
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "queued" and "daily limit" in job["message"]
