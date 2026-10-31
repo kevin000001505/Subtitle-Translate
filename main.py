@@ -1,6 +1,6 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import AfterValidator, BaseModel, Field
 from typing import Annotated
 import uvicorn
@@ -16,8 +16,14 @@ import uuid
 import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from translate_gemma import TRANSLATE_GEMMA_MODEL, TranslateGemmaClient
-from subtitle_files import (DEFAULT_TARGET_LANG, SOURCE_LANG, canonical_lang, is_source_subtitle,
+from concurrent.futures import ThreadPoolExecutor
+from typing import Literal
+import requests
+from pydantic import model_validator
+import jobs
+from media_servers import MediaServerError, configured_servers
+from translate_gemma import TRANSLATE_GEMMA_MODEL, TRANSLATE_GEMMA_URL, TranslateGemmaClient, list_models
+from subtitle_files import (DEFAULT_TARGET_LANG, LANGUAGES, SOURCE_LANG, canonical_lang, is_source_subtitle,
                             output_subtitle_path, sidecar_subtitle_path, strip_source_suffix,
                             subtitle_suffix)
 
@@ -52,6 +58,21 @@ class Translator:
     gemini_fallback: bool = False
 
 
+@dataclass
+class TranslationOutcome:
+    """What translate_single_subtitle did; truthy when the file was saved."""
+    ok: bool = False
+    limit: bool = False          # stopped at the Gemini daily limit
+    failed_chunks: int = 0       # chunks whose reply lacked their exact [ID] lines
+    unanswered_chunks: int = 0   # failed chunks the model never answered
+    unusable_chunks: int = 0     # failed chunks it answered unusably
+    total_chunks: int = 0
+    reason: str = ""             # why nothing was attempted
+
+    def __bool__(self):
+        return self.ok
+
+
 def default_translator() -> Translator:
     """The translator the app used before it could be chosen per request."""
     if TRANSLATOR_BACKEND == "gemini" and client is not None:
@@ -65,6 +86,7 @@ TIME_OFFSET_MS = -500
 
 # LIMITS
 DAILY_LIMIT = 9500  
+LIMIT_HEADROOM = 100   # queued Gemini work starts only while more calls than this remain
 GAP_THRESHOLD_MS = 2000
 MAX_CHUNK_DURATION_MS = 120000 
 DB_FILE = "/app/data/queue.db"
@@ -115,6 +137,17 @@ def _prune_sync_jobs():
     ]
     for jid in stale:
         sync_jobs.pop(jid, None)
+
+
+def ffsubsync_command(video_path: str, target_srt: str, priority: str) -> tuple[list[str], str]:
+    """The ffsubsync call that aligns target_srt in place, and its method:
+    against the English subtitle ("srt") when allowed and present, otherwise
+    against the video's audio. ffsubsync tells a subtitle reference by its
+    extension; its old --srt flag is ambiguous in current releases."""
+    en_srt = sidecar_subtitle_path(video_path, SOURCE_LANG)
+    if priority in ("srt", "auto") and os.path.exists(en_srt):
+        return ["ffsubsync", en_srt, "-i", target_srt, "-o", target_srt], "srt"
+    return ["ffsubsync", video_path, "-i", target_srt, "-o", target_srt], "audio"
 
 
 async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: str,
@@ -171,15 +204,8 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
         target_srt = sidecar_subtitle_path(video_path, target_lang)
         en_srt     = sidecar_subtitle_path(video_path, SOURCE_LANG)
 
-        use_srt_ref = (priority in ("srt", "auto")) and os.path.exists(en_srt)
-        if use_srt_ref:
-            cmd = ["ffsubsync", en_srt, "-i", target_srt, "-o", target_srt, "--srt"]
-            file_entry["method"] = "srt"
-            logger.info(f"SYNC: SRT-ref mode for {video_file}")
-        else:
-            cmd = ["ffsubsync", video_path, "-i", target_srt, "-o", target_srt]
-            file_entry["method"] = "audio"
-            logger.info(f"SYNC: Audio-ref mode for {video_file}")
+        cmd, file_entry["method"] = ffsubsync_command(video_path, target_srt, priority)
+        logger.info(f"SYNC: {file_entry['method']}-ref mode for {video_file}")
 
         try:
             result = await asyncio.to_thread(
@@ -241,6 +267,7 @@ def init_db():
         c.execute(f"ALTER TABLE job_queue ADD COLUMN target_lang TEXT NOT NULL DEFAULT '{DEFAULT_TARGET_LANG}'")
     conn.commit()
     conn.close()
+    jobs.init(DB_FILE)
 
 def log_api_call():
     try:
@@ -421,7 +448,7 @@ def get_progress_bar(current, total, length=20):
     return f"[{bar}] {int(percent * 100)}%"
 
 _ID_BLOCK_RE = re.compile(
-    r'\[(\d+)\]\s*(.*?)(?=(?:\r?\n)\s*\[\d+\]|\Z)',
+    r'\[(\d+)\][ \t]*(.*?)(?=(?:\r?\n)\s*\[\d+\]|\Z)',
     re.DOTALL,
 )
 
@@ -497,6 +524,8 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
         if result_text:
             progress_counter['completed'] += 1
             current = progress_counter['completed']
+            if progress_counter.get('report'):
+                progress_counter['report'](current / total_chunks)
             if current % 10 == 0 or current == total_chunks:
                 bar = get_progress_bar(current, total_chunks)
                 logger.info(f"PROGRESS: {bar} ({current}/{total_chunks})")
@@ -504,37 +533,48 @@ async def process_single_chunk(index, batch, context_text, total_chunks, progres
         return result_text
 
 async def translate_single_subtitle(en_sub_path: str, translator: Translator | None = None,
-                                    target_lang: str = DEFAULT_TARGET_LANG) -> bool:
+                                    target_lang: str = DEFAULT_TARGET_LANG, progress=None,
+                                    queue_on_limit: bool = True,
+                                    require_all: bool = False) -> TranslationOutcome:
     """
     Translate a single subtitle file to target_lang.
-    Returns True if successful, False otherwise.
+    Returns a TranslationOutcome, truthy when the file was saved. progress(fraction) is called
+    as chunks finish. At the daily limit the file goes to the legacy queue,
+    unless queue_on_limit is False (a library job waits in the job queue).
+    require_all refuses to save when any chunk failed, so a retry is possible.
     """
+    outcome = TranslationOutcome()
     translator = translator or default_translator()
     if translator.backend == "gemini" and client is None:
         logger.error(f"Cannot translate {en_sub_path} with {translator.model}: GEMINI_API_KEY is not set")
-        return False
+        outcome.reason = f"{translator.model} needs Gemini, but GEMINI_API_KEY is not set"
+        return outcome
     logger.info(f"START: Processing {en_sub_path}")
 
     try:
         subs = await asyncio.to_thread(pysubs2.load, en_sub_path)
     except Exception as e:
         logger.error(f"Failed to load subtitle {en_sub_path}: {e}")
-        return False
+        outcome.reason = f"Could not read the English subtitle {os.path.basename(en_sub_path)}"
+        return outcome
 
     chunks = get_smart_chunks(subs)
     total_chunks = len(chunks)
     
-    used_today = get_calls_last_24h()
-    if (used_today + total_chunks) > DAILY_LIMIT:
-        logger.warning(f"LIMIT HIT: Queueing {en_sub_path}")
-        add_to_queue(en_sub_path, target_lang)
-        return False
+    # The daily limit counts Gemini calls, so it only binds when Gemini may be used.
+    may_use_gemini = translator.backend == "gemini" or translator.gemini_fallback
+    if may_use_gemini and (get_calls_last_24h() + total_chunks) > DAILY_LIMIT:
+        logger.warning(f"LIMIT HIT: {en_sub_path}")
+        outcome.limit = True
+        if queue_on_limit:
+            add_to_queue(en_sub_path, target_lang)
+        return outcome
 
     logger.info(f"Translating {total_chunks} chunks (Concurrency: {CONCURRENCY_LIMIT})...")
     full_text_preview = " ".join([s.text.replace("\n", " ") for s in subs[:500]])
 
     tasks = []
-    progress_counter = {'completed': 0}
+    progress_counter = {'completed': 0, 'report': progress}
     
     for i, batch in enumerate(chunks):
         task = process_single_chunk(i, batch, full_text_preview, total_chunks, progress_counter, translator, target_lang)
@@ -542,17 +582,45 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
 
     results = await asyncio.gather(*tasks)
 
+    # A reply may only touch its own chunk's lines. It counts as a full
+    # translation only when every cue with visible English text gets
+    # non-empty text (not merged, not blanked, not renumbered from 1) and
+    # the reply is not the English echoed back; cues with no visible text
+    # (empty, or styling only) may be left out. The legacy path still saves
+    # partial chunks.
+    usable = []
+    for batch, raw_text in zip(chunks, results):
+        ids = {idx for idx, _ in batch}
+        source = {idx: sub.text.strip() for idx, sub in batch if sub.plaintext.strip()}
+        parsed = parse_gemini_response(raw_text) if raw_text else {}
+        usable.append({i: t for i, t in parsed.items() if i in ids})
+        translated = {i for i, t in parsed.items() if t.strip()}
+        echoed = bool(source) and all(parsed.get(i, "").strip() == text for i, text in source.items())
+        if not set(source) <= translated or echoed:
+            outcome.failed_chunks += 1
+            if raw_text:
+                outcome.unusable_chunks += 1
+            else:
+                outcome.unanswered_chunks += 1
+    outcome.total_chunks = total_chunks
+    if require_all and outcome.failed_chunks:
+        logger.error(f"FAILED: {outcome.failed_chunks} of {total_chunks} chunks of {en_sub_path} "
+                     f"had no usable translation; nothing saved")
+        return outcome
+
     # Apply translations
     success_count = 0
-    for raw_text in results:
-        if raw_text:
-            updates = parse_gemini_response(raw_text)
-            for sub_id, new_text in updates.items():
-                if 0 <= sub_id < len(subs):
-                    subs[sub_id].text = new_text.strip().replace("\r", "")
-                    success_count += 1
+    for updates in usable:
+        for sub_id, new_text in updates.items():
+            subs[sub_id].text = new_text.strip().replace("\r", "")
+            success_count += 1
 
     logger.info(f"Applied {success_count} translations.")
+    if success_count == 0:
+        # Saving would write the English text under the target name, and the
+        # skip check would then block every retry.
+        logger.error(f"FAILED: no line of {en_sub_path} was translated; nothing saved")
+        return outcome
 
     # Apply timing offset to ALL subtitles so every line is shifted consistently,
     # including any lines the translation skipped or left untouched.
@@ -574,7 +642,8 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
         pass
 
     logger.info(f"DONE: Saved {new_path}")
-    return True
+    outcome.ok = True
+    return outcome
 
 async def process_movie(input_path: str, translator: Translator | None = None, target_lang: str = DEFAULT_TARGET_LANG):
     """
@@ -671,7 +740,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
 
 async def run_next_queued_job():
     used = get_calls_last_24h()
-    if (DAILY_LIMIT - used) > 100:
+    if (DAILY_LIMIT - used) > LIMIT_HEADROOM:
         next_job = pop_from_queue()
         if next_job:
             next_file, target_lang = next_job
@@ -688,6 +757,7 @@ async def lifespan(app: FastAPI):
     # Startup
     init_db()
     asyncio.create_task(queue_monitor())
+    asyncio.create_task(job_worker())
     yield
     # Shutdown (if needed)
 
@@ -798,28 +868,346 @@ def history_endpoint(limit: int = 200):
     return {"history": get_history(limit)}
 
 
-@app.get("/list-directory")
-def list_directory_endpoint(path: str):
-    """
-    List contents of a directory for the browser UI.
-    
-    Returns JSON with items array containing {name, type, path} objects.
-    type is either "folder" or "file".
-    """
-    if not os.path.exists(path) or not os.path.isdir(path):
-        return {"items": [], "error": "Path not found or not a directory"}
-    
-    items = []
-    for entry in sorted(os.listdir(path)):
-        full_path = os.path.join(path, entry)
-        item_type = "folder" if os.path.isdir(full_path) else "file"
-        items.append({
-            "name": entry,
-            "type": item_type,
-            "path": full_path
+# ================= LIBRARY JOBS =================
+
+# Media servers configured in .env (JELLYFIN_URL / PLEX_URL), in switcher order.
+SERVERS = configured_servers()
+LIBRARY_TTL_SECONDS = 120
+_library_cache: dict = {}   # server name -> (fetched_at, titles, episodes_by_show)
+job_wakeup = asyncio.Event()
+# Lookups (media servers, llama-swap's model list) get their own threads, so
+# the library stays responsive while a translation fills the default pool;
+# posters get a separate pool so a slow server's posters can't starve them.
+LOOKUP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lookup")
+MODELS_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="models")
+POSTER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poster")
+GEMINI_RETRY_SECONDS = 600
+_gemini_blocked_until = 0.0
+
+
+async def run_in(pool, fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
+
+
+async def in_lookup_pool(fn, *args):
+    return await run_in(LOOKUP_POOL, fn, *args)
+
+
+async def run_translate_job(job, report) -> tuple[str, str]:
+    global _gemini_blocked_until
+    video, lang = job["video_path"], job["target_lang"]
+    if lang == SOURCE_LANG:
+        return "failed", "English is the source language; pick another target"
+    if not os.path.exists(video):
+        return "failed", "Video file not found"
+    out_path = sidecar_subtitle_path(video, lang)
+    if os.path.exists(out_path) and not job["overwrite"]:
+        return "skipped", f"{os.path.basename(out_path)} already exists"
+    source = sidecar_subtitle_path(video, SOURCE_LANG)
+    if not os.path.exists(source):
+        source = await extract_english_sub_from_mkv(video)
+        if source is None:
+            return "failed", "No English subtitle (no .en.srt and none in the video)"
+    translator = Translator(backend=job["backend"], model=job["model"])
+    outcome = await translate_single_subtitle(source, translator, lang, progress=report,
+                                              queue_on_limit=False, require_all=True)
+    if outcome:
+        return "done", f"Wrote {os.path.basename(out_path)}"
+    if outcome.limit:
+        _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
+        return "queued", "Waiting for Gemini's daily limit"
+    if outcome.failed_chunks:
+        problems = []
+        if outcome.unanswered_chunks:
+            problems.append(f"{job['model']} did not answer {outcome.unanswered_chunks} of {outcome.total_chunks} chunks")
+        if outcome.unusable_chunks:
+            problems.append(f"{outcome.unusable_chunks} of {outcome.total_chunks} chunks came back with missing, "
+                            f"untranslated or no usable lines" + ("" if outcome.unanswered_chunks else f" from {job['model']}"))
+        return "failed", "; ".join(problems) + "; nothing was saved, so it can be retried"
+    return "failed", outcome.reason or f"Translation with {job['model']} failed"
+
+
+async def run_shift_job(job, report) -> tuple[str, str]:
+    target = sidecar_subtitle_path(job["video_path"], job["target_lang"])
+    if not os.path.exists(target):
+        return "skipped", f"No {os.path.basename(target)} to shift"
+    offset = int(job["params"].get("offset_ms", 0))
+    subs = await asyncio.to_thread(pysubs2.load, target)
+    subs.shift(ms=offset)
+    await asyncio.to_thread(subs.save, target, encoding="utf-8")
+    return "done", f"Shifted {offset:+d} ms"
+
+
+async def run_sync_job(job, report) -> tuple[str, str]:
+    video = job["video_path"]
+    target = sidecar_subtitle_path(video, job["target_lang"])
+    if not os.path.exists(target):
+        return "skipped", f"No {os.path.basename(target)} to sync"
+    cmd, method = ffsubsync_command(video, target, job["params"].get("priority", "auto"))
+    result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=1800)
+    if result.returncode != 0:
+        return "failed", f"ffsubsync ({method}) failed: {(result.stderr or 'unknown error')[-300:]}"
+    return "done", f"Synced against the {'English subtitle' if method == 'srt' else 'audio'}"
+
+
+JOB_RUNNERS = {"translate": run_translate_job, "shift": run_shift_job, "sync": run_sync_job}
+
+
+async def run_next_job() -> bool:
+    """Run the oldest queued job to completion. Returns False when nothing
+    was runnable. Gemini jobs wait while the daily limit is (nearly) used up."""
+    gemini_waits = time.time() < _gemini_blocked_until or (DAILY_LIMIT - get_calls_last_24h()) <= LIMIT_HEADROOM
+    skip = ("gemini",) if gemini_waits else ()
+    jobs.note_waiting(DB_FILE, "gemini", "Waiting for Gemini's daily limit", gemini_waits)
+    job = jobs.claim_next(DB_FILE, skip)
+    if job is None:
+        return False
+    logger.info(f"JOB {job['id']}: {job['op']} {job['video_path']} ({job['target_lang']})")
+
+    def report(fraction):
+        jobs.update(DB_FILE, job["id"], progress=round(min(max(fraction, 0), 1) * 100, 1))
+
+    try:
+        status, message = await JOB_RUNNERS[job["op"]](job, report)
+    except Exception as e:
+        logger.exception(f"JOB {job['id']} crashed")
+        status, message = "failed", f"Error: {e}"
+
+    server = SERVERS.get(job["server"] or "")
+    if status == "done" and server and job["item_id"]:
+        try:
+            await in_lookup_pool(server.refresh, job["item_id"])
+        except Exception as e:
+            logger.warning(f"JOB {job['id']}: {server.label} refresh failed for {job['item_id']}: {e}")
+            message += f" (warning: {server.label} refresh failed: {e})"
+    if status == "done":
+        log_history(job["video_path"], job["op"])
+    progress = {"done": 100, "queued": 0}.get(status, jobs.get(DB_FILE, job["id"])["progress"])
+    jobs.update(DB_FILE, job["id"], status=status, message=message, progress=progress)
+    return True
+
+
+async def job_worker():
+    while True:
+        try:
+            if await run_next_job():
+                continue
+        except Exception:
+            logger.exception("JOB worker error")
+        job_wakeup.clear()
+        try:
+            await asyncio.wait_for(job_wakeup.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+
+
+def _server(name: str):
+    server = SERVERS.get(name)
+    if server is None:
+        raise HTTPException(404, f"Media server {name!r} is not configured")
+    return server
+
+
+async def _library(name: str, refresh: bool = False):
+    server = _server(name)
+    cached = _library_cache.get(name)
+    if cached and not refresh and time.time() - cached[0] < LIBRARY_TTL_SECONDS:
+        return cached[1], cached[2]
+    try:
+        titles = await in_lookup_pool(server.titles)
+        episodes = await in_lookup_pool(server.episodes_by_show)
+    except MediaServerError as e:
+        raise HTTPException(502, str(e))
+    unmapped = [t.server_path for t in titles if t.unmapped]
+    unmapped += [e.server_path for eps in episodes.values() for e in eps if e.unmapped]
+    if unmapped:
+        logger.warning(f"LIBRARY {name}: {len(unmapped)} file(s) are outside {name.upper()}_PATH_MAP, "
+                       f"e.g. {unmapped[0]}")
+    _library_cache[name] = (time.time(), titles, episodes)
+    return titles, episodes
+
+
+def _subtitle_status(item, lang, active) -> str:
+    """done / missing / running for a movie or episode with a reachable file;
+    unmapped when the server reports a path no path-map rule covers;
+    unavailable when there is no file at all."""
+    path = item.path
+    if not path:
+        return "unmapped" if item.unmapped else "unavailable"
+    if (path, lang) in active:
+        return "running"
+    return "done" if os.path.exists(sidecar_subtitle_path(path, lang)) else "missing"
+
+
+@app.get("/config")
+def config_endpoint():
+    return {
+        "servers": [{"name": s.name, "label": s.label} for s in SERVERS.values()],
+        "languages": [{"code": code, "name": name} for code, name in LANGUAGES.items()],
+        "default_lang": DEFAULT_TARGET_LANG,
+        "default_model": TRANSLATE_GEMMA_MODEL,
+    }
+
+
+@app.get("/models")
+async def models_endpoint():
+    gemini = {"backend": "gemini", "id": GEMINI_MODEL, "name": f"Gemini ({GEMINI_MODEL})"} if client else None
+    try:
+        local = await run_in(MODELS_POOL, list_models)
+        error = None
+    except (requests.RequestException, ValueError) as e:
+        local, error = [], f"llama-swap is unreachable at {TRANSLATE_GEMMA_URL} ({type(e).__name__})"
+    return {"local": [{"backend": "llama-swap", **m} for m in local], "local_error": error, "gemini": gemini}
+
+
+@app.get("/library/{server_name}")
+async def library_endpoint(server_name: str, lang: LangCode = DEFAULT_TARGET_LANG, refresh: bool = False):
+    titles, episodes_by_show = await _library(server_name, refresh)
+    active = jobs.active_targets(DB_FILE)
+    result = []
+    for title in titles:
+        entry = {"id": title.id, "kind": title.kind, "name": title.name, "year": title.year,
+                 "poster": f"/poster/{server_name}/{title.id}"}
+        if title.kind == "movie":
+            entry["status"] = _subtitle_status(title, lang, active)
+            if entry["status"] == "unmapped":
+                entry["server_path"] = title.server_path
+        else:
+            episodes = episodes_by_show.get(title.id, [])
+            statuses = [_subtitle_status(e, lang, active) for e in episodes]
+            available = [s for s in statuses if s not in ("unavailable", "unmapped")]
+            done = statuses.count("done")
+            entry.update(done=done, total=len(available))
+            if "running" in statuses:
+                entry["status"] = "running"
+            elif not available and "unmapped" in statuses:
+                entry["status"] = "unmapped"
+                entry["server_path"] = next(e.server_path for e in episodes if e.unmapped)
+            elif not available:
+                entry["status"] = "unavailable"
+            elif done == len(available):
+                entry["status"] = "done"
+            else:
+                entry["status"] = "partial" if done else "missing"
+        result.append(entry)
+    return {"server": server_name, "lang": lang, "titles": result}
+
+
+@app.get("/library/{server_name}/shows/{show_id}")
+async def show_endpoint(server_name: str, show_id: str, lang: LangCode = DEFAULT_TARGET_LANG):
+    server = _server(server_name)
+    try:
+        episodes = await in_lookup_pool(server.episodes, show_id)
+    except MediaServerError as e:
+        raise HTTPException(502, str(e))
+    active = jobs.active_targets(DB_FILE)
+    seasons: dict[int, list] = {}
+    for e in episodes:
+        seasons.setdefault(e.season, []).append({
+            "id": e.id, "number": e.number, "name": e.name,
+            "status": _subtitle_status(e, lang, active),
+            **({"server_path": e.server_path} if e.unmapped else {}),
         })
-    
-    return {"items": items}
+    return {"seasons": [{"season": n, "episodes": eps} for n, eps in sorted(seasons.items())]}
+
+
+@app.get("/poster/{server_name}/{item_id}")
+async def poster_endpoint(server_name: str, item_id: str):
+    server = _server(server_name)
+    try:
+        content, content_type = await run_in(POSTER_POOL, server.poster, item_id)
+    except MediaServerError:
+        raise HTTPException(404, "No poster")
+    return Response(content, media_type=content_type, headers={"Cache-Control": "max-age=86400"})
+
+
+class JobItem(BaseModel):
+    kind: Literal["movie", "show", "episode"]
+    id: str
+    show_id: str | None = None
+
+    @model_validator(mode="after")
+    def episodes_name_their_show(self):
+        if self.kind == "episode" and not self.show_id:
+            raise ValueError("an episode needs its show_id")
+        return self
+
+
+class JobRequest(BaseModel):
+    server: str
+    op: Literal["translate", "shift", "sync"] = "translate"
+    lang: LangCode = DEFAULT_TARGET_LANG
+    backend: Literal["llama-swap", "gemini"] = "llama-swap"
+    model: str = Field(default=TRANSLATE_GEMMA_MODEL, min_length=1)
+    overwrite: bool = False
+    offset_ms: int = 0
+    priority: Literal["auto", "srt", "audio"] = "auto"
+    items: list[JobItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def offered_language(self):
+        if self.lang not in LANGUAGES:
+            raise ValueError(f"lang must be one of {', '.join(LANGUAGES)}")
+        return self
+
+
+@app.post("/jobs")
+async def create_jobs(req: JobRequest):
+    """Queue one job per selected movie or episode (a show expands to every
+    episode that has a file)."""
+    if req.op == "translate" and req.lang == SOURCE_LANG:
+        raise HTTPException(400, "English is the source language; pick another target language")
+    if req.op == "translate" and req.backend == "gemini" and client is None:
+        raise HTTPException(400, "Gemini is not configured (GEMINI_API_KEY is empty)")
+    server = _server(req.server)
+    titles, episodes_by_show = await _library(req.server)
+    by_id = {t.id: t for t in titles}
+    targets, unavailable, unmapped = [], [], []   # targets: (item_id, title, item)
+    for item in req.items:
+        if item.kind == "movie":
+            title = by_id.get(item.id)
+            name = title.name if title else item.id
+            targets.append((item.id, name, title))
+        else:
+            show_id = item.id if item.kind == "show" else item.show_id
+            show = by_id.get(show_id)
+            try:
+                episodes = episodes_by_show.get(show_id) or await in_lookup_pool(server.episodes, show_id)
+            except MediaServerError as e:
+                raise HTTPException(502, str(e))
+            for e in episodes:
+                if item.kind == "episode" and e.id != item.id:
+                    continue
+                label = f"{show.name if show else show_id} S{e.season:02d}E{e.number:02d}"
+                targets.append((e.id, label, e))
+    params = {"shift": {"offset_ms": req.offset_ms}, "sync": {"priority": req.priority}}.get(req.op, {})
+    created = existing = 0
+    for item_id, name, target in targets:
+        path = target.path if target else None
+        if not path:
+            (unmapped if target and target.unmapped else unavailable).append(name)
+            continue
+        translating = req.op == "translate"
+        _, is_new = jobs.add(DB_FILE, op=req.op, video_path=path, target_lang=req.lang, title=name,
+                             server=req.server, item_id=item_id,
+                             backend=req.backend if translating else None,
+                             model=req.model if translating else None,
+                             overwrite=req.overwrite and translating, params=params)
+        created += is_new
+        existing += not is_new
+    job_wakeup.set()
+    return {"created": created, "already_queued": existing, "unavailable": unavailable, "unmapped": unmapped}
+
+
+@app.get("/jobs")
+def list_jobs(limit: int = 100):
+    return {"jobs": jobs.recent(DB_FILE, limit)}
+
+
+@app.delete("/jobs/finished")
+def clear_finished_jobs():
+    jobs.clear_finished(DB_FILE)
+    return {"status": "cleared"}
 
 
 if __name__ == "__main__":

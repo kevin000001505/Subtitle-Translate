@@ -46,7 +46,7 @@ def test_syncing_a_folder_aligns_zh_tw_against_the_english_subtitle_by_default(m
     final = sync_and_wait(TestClient(main.app), path=str(media))
 
     en, zh = str(media / "Movie.en.srt"), str(media / "Movie.zh-TW.srt")
-    assert calls == [["ffsubsync", en, "-i", zh, "-o", zh, "--srt"]]
+    assert calls == [["ffsubsync", en, "-i", zh, "-o", zh]]
     assert final["status"] == "done"
 
 
@@ -92,7 +92,7 @@ def test_syncing_a_folder_aligns_the_requested_language(media, monkeypatch):
     final = sync_and_wait(TestClient(main.app), path=str(media), target_lang="ja")
 
     en, ja = str(media / "Movie.en.srt"), str(media / "Movie.ja.srt")
-    assert calls == [["ffsubsync", en, "-i", ja, "-o", ja, "--srt"]]
+    assert calls == [["ffsubsync", en, "-i", ja, "-o", ja]]
     assert final["status"] == "done"
 
 

@@ -1,0 +1,714 @@
+import asyncio
+import subprocess
+
+import pytest
+from fastapi.testclient import TestClient
+
+import jobs
+import main
+from conftest import SAMPLE_SRT, FakeJellyfinHttp, jellyfin_routes
+from media_servers import Jellyfin, PathMap
+
+
+@pytest.fixture
+def library(tmp_path, monkeypatch, llama):
+    root = tmp_path / "lib"
+    movie = root / "Movies" / "Arrival (2016)"
+    show = root / "TV" / "Severance"
+    movie.mkdir(parents=True)
+    show.mkdir(parents=True)
+    for video in (movie / "Arrival.mkv", show / "S01E01.mkv", show / "S01E02.mkv"):
+        video.write_bytes(b"")
+        video.with_suffix(".en.srt").write_text(SAMPLE_SRT)
+    http = FakeJellyfinHttp(jellyfin_routes())
+    server = Jellyfin("http://jf:8096", "secret-key", PathMap(f"/data/media:{root}"), http)
+    monkeypatch.setattr(main, "SERVERS", {"jellyfin": server})
+    monkeypatch.setattr(main, "_library_cache", {})
+    monkeypatch.setattr(main, "_gemini_blocked_until", 0.0)
+
+    class Library:
+        pass
+    lib = Library()
+    lib.root, lib.movie, lib.show, lib.http, lib.client = root, movie, show, http, TestClient(main.app)
+    return lib
+
+
+def statuses(lib, lang="zh-TW"):
+    titles = lib.client.get(f"/library/jellyfin?lang={lang}").json()["titles"]
+    return {t["name"]: (t["status"], t.get("done"), t.get("total")) for t in titles}
+
+
+def queue(lib, **body):
+    return lib.client.post("/jobs", json={"server": "jellyfin", **body}).json()
+
+
+def run_all():
+    while asyncio.run(main.run_next_job()):
+        pass
+
+
+def test_the_library_lists_posters_and_subtitle_status(library):
+    titles = library.client.get("/library/jellyfin").json()["titles"]
+
+    assert [(t["name"], t["kind"], t["year"], t["poster"]) for t in titles] == [
+        ("Arrival", "movie", 2016, "/poster/jellyfin/m1"),
+        ("Elsewhere", "movie", 2020, "/poster/jellyfin/m2"),
+        ("Severance", "show", 2022, "/poster/jellyfin/s1"),
+    ]
+    assert statuses(library) == {"Arrival": ("missing", None, None),
+                                 "Elsewhere": ("unmapped", None, None),
+                                 "Severance": ("missing", 0, 2)}
+
+
+def test_badges_follow_the_files_and_the_language(library):
+    (library.movie / "Arrival.zh-TW.srt").write_text(SAMPLE_SRT)
+    (library.show / "S01E01.zh-TW.srt").write_text(SAMPLE_SRT)
+
+    assert statuses(library)["Arrival"][0] == "done"
+    assert statuses(library)["Severance"] == ("partial", 1, 2)
+    assert statuses(library, "ja")["Arrival"][0] == "missing"
+
+
+def test_posters_come_through_the_backend_without_the_key(library):
+    response = library.client.get("/poster/jellyfin/m1")
+
+    assert response.content == b"poster-bytes"
+    assert "secret-key" not in library.client.get("/library/jellyfin").text
+
+
+def test_an_unconfigured_server_is_reported(library):
+    assert library.client.get("/library/plex").status_code == 404
+
+
+def test_queued_movie_is_translated_and_refreshed_in_the_server(library):
+    assert queue(library, items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert statuses(library)["Arrival"][0] == "running"
+
+    run_all()
+
+    assert (library.movie / "Arrival.zh-TW.srt").exists()
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert (job["status"], job["progress"], job["title"]) == ("done", 100, "Arrival")
+    assert ("POST", "/Items/m1/Refresh") in [(c["method"], c["path"]) for c in library.http.calls]
+
+
+def test_the_same_movie_is_not_queued_twice(library):
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+
+    assert queue(library, items=[{"kind": "movie", "id": "m1"}]) == \
+        {"created": 0, "already_queued": 1, "unavailable": [], "unmapped": []}
+
+
+def test_a_show_expands_to_one_job_per_episode_with_a_file(library):
+    result = queue(library, lang="ja", items=[{"kind": "show", "id": "s1"}])
+
+    assert result == {"created": 2, "already_queued": 0, "unavailable": ["Severance S02E01"], "unmapped": []}
+    run_all()
+    assert (library.show / "S01E01.ja.srt").exists() and (library.show / "S01E02.ja.srt").exists()
+
+
+def test_a_single_episode_can_be_queued(library):
+    queue(library, items=[{"kind": "episode", "id": "e2", "show_id": "s1"}])
+    run_all()
+
+    assert [p.name for p in sorted(library.show.glob("*.zh-TW.srt"))] == ["S01E02.zh-TW.srt"]
+
+
+def test_an_existing_subtitle_is_skipped_unless_overwrite(library, llama):
+    (library.movie / "Arrival.zh-TW.srt").write_text("keep me")
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+    assert (library.movie / "Arrival.zh-TW.srt").read_text() == "keep me"
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "skipped"
+
+    queue(library, overwrite=True, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+    assert "zh-TW: Hello" in (library.movie / "Arrival.zh-TW.srt").read_text()
+
+
+def test_the_chosen_model_translates_with_no_gemini_fallback(library, llama, gemini):
+    llama.status_code = 500
+    queue(library, model="qwen3-14b", items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "qwen3-14b" in job["message"]
+    assert {r["json"]["model"] for r in llama.requests} == {"qwen3-14b"}
+    assert gemini.prompts == []
+
+
+def test_a_failed_job_does_not_stop_the_next(library):
+    (library.movie / "Arrival.mkv").unlink()
+    queue(library, items=[{"kind": "movie", "id": "m1"}, {"kind": "episode", "id": "e1", "show_id": "s1"}])
+    run_all()
+
+    assert [j["status"] for j in library.client.get("/jobs").json()["jobs"]] == ["done", "failed"]
+
+
+def test_gemini_jobs_wait_while_the_daily_limit_is_used(library, gemini, monkeypatch):
+    monkeypatch.setattr(main, "get_calls_last_24h", lambda: main.DAILY_LIMIT)
+    queue(library, backend="gemini", model="gemini-2.5-flash-lite", items=[{"kind": "movie", "id": "m1"}])
+    queue(library, items=[{"kind": "episode", "id": "e1", "show_id": "s1"}])
+
+    run_all()
+
+    assert {j["title"]: j["status"] for j in library.client.get("/jobs").json()["jobs"]} == {
+        "Arrival": "queued", "Severance S01E01": "done"}
+
+
+def test_a_job_running_at_restart_is_marked_failed(library):
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    jobs.claim_next(main.DB_FILE)
+
+    jobs.init(main.DB_FILE)
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert (job["status"], job["message"]) == ("failed", "Interrupted by a restart")
+
+
+def test_shift_and_sync_jobs_act_on_the_chosen_language(library, monkeypatch):
+    calls = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    (library.movie / "Arrival.ja.srt").write_text(SAMPLE_SRT)
+
+    queue(library, op="shift", lang="ja", offset_ms=1000, items=[{"kind": "movie", "id": "m1"}])
+    queue(library, op="sync", lang="ja", items=[{"kind": "movie", "id": "m1"}])
+    queue(library, op="shift", lang="ko", items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    import pysubs2
+    assert [s.start for s in pysubs2.load(str(library.movie / "Arrival.ja.srt"))] == [2000, 4000]
+    ja, en = str(library.movie / "Arrival.ja.srt"), str(library.movie / "Arrival.en.srt")
+    assert calls == [["ffsubsync", en, "-i", ja, "-o", ja]]
+    assert [j["status"] for j in library.client.get("/jobs").json()["jobs"]] == ["skipped", "done", "done"]
+
+
+def test_models_list_llama_swap_and_gemini(library, monkeypatch, gemini):
+    monkeypatch.setattr(main, "list_models", lambda: [{"id": "qwen3-14b", "name": "qwen3-14b", "loaded": True}])
+
+    body = library.client.get("/models").json()
+
+    assert body["local"] == [{"backend": "llama-swap", "id": "qwen3-14b", "name": "qwen3-14b", "loaded": True}]
+    assert body["gemini"]["id"] == "gemini-2.5-flash-lite" and body["local_error"] is None
+
+
+def test_models_report_an_unreachable_llama_swap(library, monkeypatch):
+    import requests
+
+    def down():
+        raise requests.ConnectionError("refused")
+    monkeypatch.setattr(main, "list_models", down)
+
+    body = library.client.get("/models").json()
+
+    assert body["local"] == [] and "unreachable" in body["local_error"] and body["gemini"] is None
+
+
+def test_config_lists_servers_and_languages(library):
+    body = library.client.get("/config").json()
+
+    assert body["servers"] == [{"name": "jellyfin", "label": "Jellyfin"}]
+    assert [l["code"] for l in body["languages"]] == ["zh-TW", "zh-CN", "ja", "ko", "en"]
+    assert body["default_lang"] == "zh-TW"
+
+
+def test_show_page_lists_seasons_and_episode_status(library):
+    (library.show / "S01E02.zh-TW.srt").write_text(SAMPLE_SRT)
+
+    seasons = library.client.get("/library/jellyfin/shows/s1").json()["seasons"]
+
+    assert [(s["season"], [(e["number"], e["status"]) for e in s["episodes"]]) for s in seasons] == [
+        (1, [(1, "missing"), (2, "done")]), (2, [(1, "unavailable")])]
+
+
+# ---- review / QA fixes ----
+
+def test_translating_to_the_source_language_is_refused(library):
+    response = library.client.post("/jobs", json={"server": "jellyfin", "lang": "en", "overwrite": True,
+                                                  "items": [{"kind": "movie", "id": "m1"}]})
+
+    assert response.status_code == 400
+    assert (library.movie / "Arrival.en.srt").read_text() == SAMPLE_SRT
+
+
+def test_jobs_only_accept_the_offered_languages(library):
+    response = library.client.post("/jobs", json={"server": "jellyfin", "lang": "xx",
+                                                  "items": [{"kind": "movie", "id": "m1"}]})
+    assert response.status_code == 422
+
+
+def test_an_empty_model_is_refused(library):
+    response = library.client.post("/jobs", json={"server": "jellyfin", "model": "",
+                                                  "items": [{"kind": "movie", "id": "m1"}]})
+    assert response.status_code == 422
+
+
+def test_a_path_outside_the_path_map_is_reported_as_unmapped(library):
+    titles = {t["name"]: t for t in library.client.get("/library/jellyfin").json()["titles"]}
+
+    assert titles["Elsewhere"]["status"] == "unmapped"
+    assert titles["Elsewhere"]["server_path"] == "/data/JellyBridge/Elsewhere.mkv"
+
+
+def test_a_failed_refresh_is_logged_and_shown(library):
+    import logging
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger("SubtitleAPI").addHandler(handler)
+    library.http.routes[("POST", "/Items/m1/Refresh")] = 500
+    try:
+        queue(library, items=[{"kind": "movie", "id": "m1"}])
+        run_all()
+    finally:
+        logging.getLogger("SubtitleAPI").removeHandler(handler)
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "done" and "refresh failed" in job["message"]
+    assert any("refresh failed" in r.getMessage() for r in records)
+
+
+def test_a_partly_failed_translation_fails_and_writes_nothing(library, llama, monkeypatch):
+    original = llama.post
+    calls = {"n": 0}
+
+    def flaky(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        if "Goodbye" in json["messages"][0]["content"][0]["text"].split("INPUT:")[1]:
+            llama.status_code = 500
+            try:
+                return original(url, headers=headers, json=json, timeout=timeout)
+            finally:
+                llama.status_code = 200
+        return original(url, headers=headers, json=json, timeout=timeout)
+    import translate_gemma
+    monkeypatch.setattr(translate_gemma.requests, "post", flaky)
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (library.movie / "Arrival.en.srt").write_text(two_chunks)
+
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "1 of 2" in job["message"]
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_request_with_different_settings_is_not_dropped_as_a_duplicate(library):
+    (library.movie / "Arrival.zh-TW.srt").write_text(SAMPLE_SRT)
+    assert queue(library, op="shift", offset_ms=5000, items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, op="shift", offset_ms=-5000, items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, op="shift", offset_ms=-5000, items=[{"kind": "movie", "id": "m1"}])["already_queued"] == 1
+
+
+def test_a_gemini_job_over_the_daily_limit_waits_instead_of_failing(library, gemini, monkeypatch):
+    over_the_limit(monkeypatch)
+
+    queue(library, backend="gemini", model="gemini-2.5-flash-lite", items=[{"kind": "movie", "id": "m1"}])
+    asyncio.run(main.run_next_job())
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "queued" and "daily limit" in job["message"]
+    assert gemini.prompts == []
+    assert asyncio.run(main.run_next_job()) is False      # it waits instead of being claimed again
+
+
+def test_an_episode_without_its_show_is_refused(library):
+    response = library.client.post("/jobs", json={"server": "jellyfin", "items": [{"kind": "episode", "id": "e1"}]})
+    assert response.status_code == 422
+
+
+def test_an_unreachable_server_while_queueing_is_a_502(library):
+    library.http.routes[("GET", "/Shows/zz/Episodes")] = 500
+    response = library.client.post("/jobs", json={"server": "jellyfin", "items": [{"kind": "show", "id": "zz"}]})
+    assert response.status_code == 502
+
+
+def test_progress_is_reported_while_translating(library, monkeypatch):
+    seen = []
+    real_update = jobs.update
+    monkeypatch.setattr(main.jobs, "update", lambda db, jid, **f: (seen.append(f.get("progress")), real_update(db, jid, **f)))
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (library.movie / "Arrival.en.srt").write_text(two_chunks)
+
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert 50.0 in seen
+
+
+def over_the_limit(monkeypatch):
+    """Enough headroom for the worker to start a Gemini job, too little for the file."""
+    monkeypatch.setattr(main, "get_calls_last_24h", lambda: main.DAILY_LIMIT - 101)
+    monkeypatch.setattr(main, "get_smart_chunks", lambda subs: [[(i, s)] for i, s in enumerate(subs)] * 60)
+
+
+def test_library_jobs_never_enter_the_legacy_queue(library, gemini, monkeypatch):
+    over_the_limit(monkeypatch)
+    queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
+    asyncio.run(main.run_next_job())
+    assert "daily limit" in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+    assert main.pop_from_queue() is None
+
+
+def test_finished_jobs_can_be_cleared(library):
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+    queue(library, items=[{"kind": "episode", "id": "e1", "show_id": "s1"}])
+
+    library.client.delete("/jobs/finished")
+
+    assert [j["title"] for j in library.client.get("/jobs").json()["jobs"]] == ["Severance S01E01"]
+
+
+def test_a_missing_poster_is_a_404(library):
+    assert library.client.get("/poster/jellyfin/nope").status_code == 404
+
+
+def test_the_library_can_be_refreshed_from_the_server(library):
+    library.client.get("/library/jellyfin")
+    calls = len(library.http.calls)
+    library.client.get("/library/jellyfin")
+    assert len(library.http.calls) == calls
+    library.client.get("/library/jellyfin?refresh=true")
+    assert len(library.http.calls) > calls
+
+
+def test_gemini_jobs_need_a_key(library):
+    response = library.client.post("/jobs", json={"server": "jellyfin", "backend": "gemini", "model": "g",
+                                                  "items": [{"kind": "movie", "id": "m1"}]})
+    assert response.status_code == 400
+
+
+def test_no_response_carries_the_server_key(library, gemini, monkeypatch):
+    monkeypatch.setattr(main, "list_models", lambda: [])
+    for path in ("/config", "/models", "/library/jellyfin", "/library/jellyfin/shows/s1", "/poster/jellyfin/m1", "/jobs"):
+        response = library.client.get(path)
+        assert "secret-key" not in response.text and "secret-key" not in str(response.headers), path
+
+
+def test_a_queued_gemini_job_whose_key_disappeared_says_so(library, gemini, monkeypatch):
+    queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
+    monkeypatch.setattr(main, "client", None)
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "GEMINI_API_KEY" in job["message"]
+
+
+def test_replies_without_any_usable_line_are_reported_as_unusable(library, llama, monkeypatch):
+    llama_post = llama.post
+
+    def no_ids(url, headers=None, json=None, timeout=None):
+        response = llama_post(url, headers=headers, json=json, timeout=timeout)
+        response._content = "Sorry, I cannot help with that."
+        return response
+    import translate_gemma
+    monkeypatch.setattr(translate_gemma.requests, "post", no_ids)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "1 of 1" in job["message"] and "no usable" in job["message"]
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_chunk_whose_reply_has_no_usable_line_fails_the_job(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+
+    def garble_second(url, headers=None, json=None, timeout=None):
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        if "Goodbye" in json["messages"][0]["content"][0]["text"].split("INPUT:")[1]:
+            response._content = "Here is your translation, enjoy!"
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", garble_second)
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (library.movie / "Arrival.en.srt").write_text(two_chunks)
+
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "1 of 2" in job["message"]
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_the_worker_refuses_a_job_that_would_overwrite_the_source(library):
+    jobs.add(main.DB_FILE, op="translate", video_path=str(library.movie / "Arrival.mkv"), target_lang="en",
+             title="Arrival", backend="llama-swap", model="m", overwrite=True)
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert (library.movie / "Arrival.en.srt").read_text() == SAMPLE_SRT
+
+
+def test_a_different_model_or_overwrite_is_a_new_job(library):
+    assert queue(library, model="a", items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, model="b", items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, model="b", overwrite=True, items=[{"kind": "movie", "id": "m1"}])["created"] == 1
+    assert queue(library, model="b", overwrite=True, items=[{"kind": "movie", "id": "m1"}])["already_queued"] == 1
+
+
+def test_a_show_whose_files_are_all_unmapped_is_reported_as_unmapped(library):
+    from conftest import JELLYFIN_EPISODES
+    bridged = {"Items": [dict(e, Path=e["Path"].replace("/data/media", "/data/JellyBridge"))
+                         for e in JELLYFIN_EPISODES["Items"] if "Path" in e]}
+    library.http.routes[("GET", "/Shows/s1/Episodes")] = bridged
+    library.http.episode_items = bridged
+
+    titles = {t["name"]: t for t in library.client.get("/library/jellyfin").json()["titles"]}
+    result = queue(library, items=[{"kind": "show", "id": "s1"}])
+
+    assert titles["Severance"]["status"] == "unmapped"
+    assert result["unmapped"] == ["Severance S01E01", "Severance S01E02"]
+
+
+def reply_with(monkeypatch, llama, rewrite):
+    import translate_gemma
+    original = llama.post
+
+    def patched(url, headers=None, json=None, timeout=None):
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        response._content = rewrite(response._content)
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", patched)
+
+
+def test_a_reply_that_merges_lines_fails_the_job(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.splitlines()[0] + " (and the rest)")
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_reply_numbered_from_one_fails_the_job(library, llama, monkeypatch):
+    import re
+    reply_with(monkeypatch, llama, lambda text: re.sub(r"\[(\d+)\]", lambda m: f"[{int(m.group(1)) + 1}]", text))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_reply_with_ids_from_outside_the_chunk_never_overwrites_other_lines(media, llama, monkeypatch):
+    # Two chunks (a gap over 2 s): chunk 1's reply, applied last, also claims chunk 0's line.
+    reply_with(monkeypatch, llama, lambda text: text + "\n[0] hijacked" if "[1]" in text else text)
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (media / "Movie.en.srt").write_text(two_chunks)
+
+    asyncio.run(main.process_movie(str(media)))
+
+    import pysubs2
+    assert [s.text for s in pysubs2.load(str(media / "Movie.zh-TW.srt"))] == ["zh-TW: Hello", "zh-TW: Goodbye"]
+
+
+def test_a_subtitle_with_an_empty_cue_translates(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.replace("[1] zh-TW: ", "[1] "))   # echoes the empty cue as "[1] "
+    with_empty = """1
+00:00:01,000 --> 00:00:02,000
+Hello
+
+2
+00:00:02,500 --> 00:00:03,000
+
+
+3
+00:00:03,500 --> 00:00:04,000
+Goodbye
+"""
+    (library.movie / "Arrival.en.srt").write_text(with_empty)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+
+
+def test_the_model_list_does_not_wait_for_media_server_lookups(library, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    busy = ThreadPoolExecutor(max_workers=1)
+    busy.shutdown()                       # any lookup sent here fails at once
+    monkeypatch.setattr(main, "LOOKUP_POOL", busy)
+    monkeypatch.setattr(main, "list_models", lambda: [{"id": "m", "name": "m", "loaded": False}])
+
+    assert library.client.get("/models").json()["local"][0]["id"] == "m"
+
+
+def test_a_mostly_unanswered_job_names_the_model(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+
+    def answer_first_only(url, headers=None, json=None, timeout=None):
+        if "Goodbye" in json["messages"][0]["content"][0]["text"].split("INPUT:")[1]:
+            llama.status_code = 500
+            try:
+                return original(url, headers=headers, json=json, timeout=timeout)
+            finally:
+                llama.status_code = 200
+        return original(url, headers=headers, json=json, timeout=timeout)
+    monkeypatch.setattr(translate_gemma.requests, "post", answer_first_only)
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (library.movie / "Arrival.en.srt").write_text(two_chunks)
+
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert "did not answer 1 of 2" in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+
+def test_a_bad_language_in_a_library_url_is_a_422(library):
+    assert library.client.get("/library/jellyfin?lang=1").status_code == 422
+    assert library.client.get("/library/jellyfin/shows/s1?lang=x1").status_code == 422
+
+
+def test_a_model_that_never_answers_is_named_as_unreachable(library, llama):
+    llama.status_code = 500
+    queue(library, model="qwen3-14b", items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "did not answer" in message and "qwen3-14b" in message
+
+
+THREE_CUES_WITH_EMPTY = """1
+00:00:01,000 --> 00:00:02,000
+Alpha
+
+2
+00:00:02,500 --> 00:00:03,000
+
+
+3
+00:00:03,500 --> 00:00:04,000
+Bravo
+"""
+
+
+def test_a_blank_translation_of_a_real_line_fails_the_job(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: Goodbye", ""))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_reply_that_leaves_out_empty_cues_still_translates(library, llama, monkeypatch):
+    import re
+    reply_with(monkeypatch, llama, lambda text: re.sub(r"\[1\] zh-TW: \n?", "", text))
+    (library.movie / "Arrival.en.srt").write_text(THREE_CUES_WITH_EMPTY)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    import pysubs2
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+    assert [s.text for s in pysubs2.load(str(library.movie / "Arrival.zh-TW.srt"))] == \
+        ["zh-TW: Alpha", "", "zh-TW: Bravo"]
+
+
+def test_unanswered_and_unusable_chunks_are_both_reported(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+    three = "".join(f"{i + 1}\n00:{i:02d}:00,000 --> 00:{i:02d}:01,000\nLine {i}\n\n" for i in range(3))
+    (library.movie / "Arrival.en.srt").write_text(three)
+
+    def mixed(url, headers=None, json=None, timeout=None):
+        batch = json["messages"][0]["content"][0]["text"].split("INPUT:")[1]
+        if "Line 1" in batch:
+            llama.status_code = 500
+            try:
+                return original(url, headers=headers, json=json, timeout=timeout)
+            finally:
+                llama.status_code = 200
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        if "Line 2" in batch:
+            response._content = "no ids here"
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", mixed)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "did not answer 1 of 3" in message and "1 of 3 chunks came back" in message
+
+
+def test_gemini_jobs_held_back_by_the_limit_say_why(library, gemini, monkeypatch):
+    monkeypatch.setattr(main, "get_calls_last_24h", lambda: main.DAILY_LIMIT)
+    queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
+    asyncio.run(main.run_next_job())
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "queued" and "daily limit" in job["message"]
+
+
+def test_a_styling_only_cue_may_be_left_out(library, llama, monkeypatch):
+    import re
+    reply_with(monkeypatch, llama, lambda text: re.sub(r"\[1\][^\n]*\n?", "", text))
+    (library.movie / "Arrival.en.srt").write_text(THREE_CUES_WITH_EMPTY.replace("\n\n\n3", "\n<i></i>\n\n3"))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+
+
+def test_a_model_that_echoes_the_english_fails_the_job(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: ", ""))
+    (library.movie / "Arrival.zh-TW.srt").write_text("good translation")
+    queue(library, overwrite=True, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert (library.movie / "Arrival.zh-TW.srt").read_text() == "good translation"
+
+
+def test_an_unanswered_chunk_of_empty_cues_never_gives_a_negative_count(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+    blank_then_line = "1\n00:00:01,000 --> 00:00:02,000\n\n\n2\n00:00:30,000 --> 00:00:31,000\nHello\n"
+    (library.movie / "Arrival.en.srt").write_text(blank_then_line)
+
+    def first_unanswered(url, headers=None, json=None, timeout=None):
+        if "Hello" not in json["messages"][0]["content"][0]["text"].split("INPUT:")[1]:
+            llama.status_code = 500
+            try:
+                return original(url, headers=headers, json=json, timeout=timeout)
+            finally:
+                llama.status_code = 200
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        response._content = "no ids"
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", first_unanswered)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "-1" not in message and "1 of 2 chunks came back with missing" in message
+
+
+def test_the_waiting_note_clears_when_the_limit_does(library, gemini, monkeypatch):
+    used = {"calls": main.DAILY_LIMIT}
+    monkeypatch.setattr(main, "get_calls_last_24h", lambda: used["calls"])
+    queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
+    asyncio.run(main.run_next_job())
+    assert "daily limit" in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+    used["calls"] = 0
+    monkeypatch.setattr(main.jobs, "claim_next", lambda db, skip=(): None)   # still behind other work
+    asyncio.run(main.run_next_job())
+
+    assert library.client.get("/jobs").json()["jobs"][0]["message"] == ""
+
+
+def test_the_waiting_note_never_replaces_another_message(library):
+    job, _ = jobs.add(main.DB_FILE, op="translate", video_path="/v.mkv", target_lang="ja", backend="gemini", model="g")
+    jobs.update(main.DB_FILE, job["id"], message="Interrupted by a restart")
+
+    jobs.note_waiting(main.DB_FILE, "gemini", "Waiting for Gemini's daily limit", True)
+    jobs.note_waiting(main.DB_FILE, "gemini", "Waiting for Gemini's daily limit", False)
+
+    assert jobs.get(main.DB_FILE, job["id"])["message"] == "Interrupted by a restart"

@@ -330,3 +330,12 @@ def test_translategemma_is_told_the_source_is_english(media, llama):
     translate(media)
 
     assert llama.requests[0]["json"]["messages"][0]["content"][0]["source_lang_code"] == "en"
+
+
+def test_nothing_is_saved_when_no_line_was_translated(media, llama):
+    llama.status_code = 500
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+
+    run_process_movie(media, translator=main.Translator(backend="llama-swap", model="qwen3"))
+
+    assert not (media / "Movie.zh-TW.srt").exists()

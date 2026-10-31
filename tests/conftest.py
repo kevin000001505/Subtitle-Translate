@@ -56,16 +56,21 @@ class FakeLlamaSwap:
     def __init__(self, status_code=200):
         self.status_code = status_code
         self.requests = []
+        self.prefix = ""   # e.g. a <think> block a reasoning model emits first
 
     def post(self, url, headers=None, json=None, timeout=None):
         self.requests.append({"url": url, "json": json})
         if self.status_code != 200:
             return FakeResponse(self.status_code, "server error")
-        item = json["messages"][0]["content"][0]
-        body = item["text"].split("INPUT:", 1)[1]
-        target = item["target_lang_code"]
+        content = json["messages"][0]["content"]
+        if isinstance(content, list):          # TranslateGemma's structured request
+            body = content[0]["text"].split("INPUT:", 1)[1]
+            target = content[0]["target_lang_code"]
+        else:                                  # plain chat prompt: system names the language
+            body = json["messages"][1]["content"].split("INPUT:", 1)[1]
+            target = re.search(r"\((\S+)\)\.", content).group(1)
         reply = "\n".join(f"[{i}] {target}: {t}" for i, t in _LINE_RE.findall(body))
-        return FakeResponse(200, reply)
+        return FakeResponse(200, self.prefix + reply)
 
 
 class FakeGemini:
@@ -137,3 +142,68 @@ def make_mkv(tmp_path):
         )
         return path
     return make
+
+
+class FakeHttp:
+    """Stands in for requests.Session against a media server: routes map
+    (METHOD, path) to a JSON body, bytes, or an HTTP status code."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    def request(self, method, url, params=None, headers=None, timeout=None):
+        path = "/" + url.split("://", 1)[1].split("/", 1)[1]
+        self.calls.append({"method": method, "path": path, "params": params, "headers": headers, "timeout": timeout})
+        body = self.routes.get((method, path), 404)
+
+        class _Resp:
+            pass
+        resp = _Resp()
+        resp.status_code = body if isinstance(body, int) else 200
+        resp.headers = {"Content-Type": "image/png"}
+        resp.content = body if isinstance(body, bytes) else b""
+        resp.json = lambda: body
+        return resp
+
+
+JELLYFIN_ITEMS = {"Items": [
+    {"Id": "m1", "Name": "Arrival", "Type": "Movie", "ProductionYear": 2016,
+     "Path": "/data/media/Movies/Arrival (2016)/Arrival.mkv"},
+    {"Id": "m2", "Name": "Elsewhere", "Type": "Movie", "ProductionYear": 2020,
+     "Path": "/data/JellyBridge/Elsewhere.mkv"},
+    {"Id": "s1", "Name": "Severance", "Type": "Series", "ProductionYear": 2022},
+], "TotalRecordCount": 3}
+
+JELLYFIN_EPISODES = {"Items": [
+    {"Id": "e2", "Name": "Half Loop", "SeriesId": "s1", "ParentIndexNumber": 1, "IndexNumber": 2,
+     "Path": "/data/media/TV/Severance/S01E02.mkv", "LocationType": "FileSystem"},
+    {"Id": "e1", "Name": "Good News", "SeriesId": "s1", "ParentIndexNumber": 1, "IndexNumber": 1,
+     "Path": "/data/media/TV/Severance/S01E01.mkv", "LocationType": "FileSystem"},
+    {"Id": "e3", "Name": "Unaired", "SeriesId": "s1", "ParentIndexNumber": 2, "IndexNumber": 1,
+     "LocationType": "Virtual"},
+]}
+
+
+def jellyfin_routes():
+    return {
+        ("GET", "/Items"): None,  # filled per call type below
+        ("GET", "/Shows/s1/Episodes"): JELLYFIN_EPISODES,
+        ("GET", "/Items/m1/Images/Primary"): b"poster-bytes",
+        ("POST", "/Items/m1/Refresh"): b"",
+        ("POST", "/Items/e1/Refresh"): b"",
+    }
+
+
+class FakeJellyfinHttp(FakeHttp):
+    """/Items answers with titles or with all episodes depending on IncludeItemTypes;
+    set episode_items to change the episode listing."""
+
+    episode_items = None
+
+    def request(self, method, url, params=None, headers=None, timeout=None):
+        if url.endswith("/Items") and params:
+            episodes = self.episode_items or JELLYFIN_EPISODES
+            self.routes[("GET", "/Items")] = (
+                episodes if params.get("IncludeItemTypes") == "Episode" else JELLYFIN_ITEMS)
+        return super().request(method, url, params, headers, timeout)
