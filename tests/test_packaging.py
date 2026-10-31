@@ -37,8 +37,16 @@ def test_the_compose_wires_the_webroot_check_and_restart_policies():
     mount = re.search(r"^\s*- \./frontend/check-webroot\.sh:([\w./-]+):ro\s*$", frontend, re.M)
     assert mount and not mount.group(1).startswith("/usr/share/nginx/html")
 
-    # The command runs the check first, then starts nginx in the foreground
+    # The check-then-start program must be one shell string passed to
+    # `sh -c` as a YAML list: compose v5+ drops shell operators from
+    # scalar commands, so a scalar `command: ... && ...` would run the
+    # check and silently never start nginx.
+    m = re.search(r"^\s*command:\s*\n((?:\s+- .+\n)+)", frontend, re.M)
+    assert m, "frontend command must be a YAML list so the shell survives compose"
+    items = [line.strip()[2:] for line in m.group(1).splitlines()]
+    assert items[:2] == ["sh", "-c"]
+    # The program runs the check first, then starts nginx in the foreground
     # through the official entrypoint, so its configuration hooks still run.
-    command = re.search(r"^\s*command:\s*(.+)$", frontend, re.M).group(1)
-    assert command.index("check-webroot.sh") < command.index("&&") < command.index("nginx")
-    assert "docker-entrypoint.sh" in command
+    program = items[2]
+    assert program.index("check-webroot.sh") < program.index("&&") < program.index("nginx")
+    assert "docker-entrypoint.sh" in program

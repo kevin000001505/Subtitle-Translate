@@ -35,5 +35,11 @@ services:
     restart: unless-stopped
     # Fail loudly when the web root lost index.html (stale bind mount),
     # then start nginx in the foreground through the official entrypoint so
-    # its standard configuration hooks still run.
-    command: sh /usr/local/bin/check-webroot.sh && exec /docker-entrypoint.sh nginx -g 'daemon off;'
+    # its standard configuration hooks still run. The check-then-start
+    # program is one shell string passed to `sh -c`: compose v5+ drops
+    # shell operators from scalar commands, so a scalar command would
+    # silently never start nginx.
+    command:
+      - sh
+      - -c
+      - sh /usr/local/bin/check-webroot.sh && exec /docker-entrypoint.sh nginx -g 'daemon off;'
