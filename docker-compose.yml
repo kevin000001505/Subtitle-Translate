@@ -19,6 +19,7 @@ services:
       - ${MEDIA}/media:/media
       - ./queue_data:/app/data
     command: uvicorn main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
 
   frontend:
     image: nginx:alpine
@@ -27,5 +28,18 @@ services:
     volumes:
       - ./frontend/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./frontend:/usr/share/nginx/html:ro
+      # The check runs from a path outside the web root.
+      - ./frontend/check-webroot.sh:/usr/local/bin/check-webroot.sh:ro
     depends_on:
       - backend
+    restart: unless-stopped
+    # Fail loudly when the web root lost index.html (stale bind mount),
+    # then start nginx in the foreground through the official entrypoint so
+    # its standard configuration hooks still run. The check-then-start
+    # program is one shell string passed to `sh -c`: compose v5+ drops
+    # shell operators from scalar commands, so a scalar command would
+    # silently never start nginx.
+    command:
+      - sh
+      - -c
+      - sh /usr/local/bin/check-webroot.sh && exec /docker-entrypoint.sh nginx -g 'daemon off;'
