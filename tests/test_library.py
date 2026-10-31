@@ -663,7 +663,7 @@ def test_a_model_that_echoes_the_english_fails_the_job(library, llama, monkeypat
     run_all()
 
     job = library.client.get("/jobs").json()["jobs"][0]
-    assert job["status"] == "failed" and "returned the English unchanged" in job["message"]
+    assert job["status"] == "failed" and "English unchanged" in job["message"]
     assert (library.movie / "Arrival.zh-TW.srt").read_text() == "good translation"
 
 
@@ -735,3 +735,15 @@ def test_a_file_with_no_visible_text_is_not_reported_as_echoed(library):
     run_all()
 
     assert "unchanged" not in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+
+def test_a_model_that_echoes_most_of_the_file_fails_the_job(library, llama, monkeypatch):
+    many = "".join(f"{i + 1}\n00:{i:02d}:00,000 --> 00:{i:02d}:01,000\nLine {i}\n\n" for i in range(20))
+    (library.movie / "Arrival.en.srt").write_text(many)
+    reply_with(monkeypatch, llama, lambda text: text if "Line 0" in text else text.replace("zh-TW: ", ""))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "unchanged" in job["message"]
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()

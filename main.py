@@ -66,7 +66,7 @@ class TranslationOutcome:
     failed_chunks: int = 0       # chunks whose reply lacked their exact [ID] lines
     unanswered_chunks: int = 0   # failed chunks the model never answered
     unusable_chunks: int = 0     # failed chunks it answered unusably
-    echoed: bool = False         # every visible cue came back as the English
+    echoed: bool = False         # most visible cues came back as the English
     total_chunks: int = 0
     reason: str = ""             # why nothing was attempted
 
@@ -587,8 +587,8 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     # translation only when every cue with visible English text gets
     # non-empty text (not merged, not blanked, not renumbered from 1); cues
     # with no visible text (empty, or styling only) may be left out. Single
-    # cues may stay the same ("OK", a name, "♪"), but a file whose every
-    # visible cue comes back unchanged was echoed, not translated. The
+    # cues may stay the same ("OK", a name, "♪"), but a file where most
+    # visible cues come back unchanged was echoed, not translated. The
     # legacy path still saves partial chunks.
     usable = []
     visible = unchanged = 0
@@ -607,10 +607,10 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
             else:
                 outcome.unanswered_chunks += 1
     outcome.total_chunks = total_chunks
-    outcome.echoed = visible > 0 and unchanged == visible
+    outcome.echoed = visible > 0 and unchanged * 2 > visible
     if require_all and (outcome.failed_chunks or outcome.echoed):
         problem = (f"{outcome.failed_chunks} of {total_chunks} chunks had no usable translation"
-                   if outcome.failed_chunks else "the model returned the English unchanged")
+                   if outcome.failed_chunks else "the model returned most of the English unchanged")
         logger.error(f"FAILED: {en_sub_path}: {problem}; nothing saved")
         return outcome
 
@@ -922,8 +922,8 @@ async def run_translate_job(job, report) -> tuple[str, str]:
     if outcome.limit:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
-    if outcome.echoed and not outcome.failed_chunks:
-        return "failed", (f"{job['model']} returned the English unchanged; nothing was saved, "
+    if outcome.echoed:
+        return "failed", (f"{job['model']} returned most of the English unchanged; nothing was saved, "
                           f"so it can be retried with another model")
     if outcome.failed_chunks:
         problems = []
