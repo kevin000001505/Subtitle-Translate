@@ -275,6 +275,7 @@ function clearSelection() {
 // 7. Show dialog ───────────────────────────────────────────────
 async function openShow(t) {
     state.show = t;
+    t.seasons = null;                          // never redraw rows from an earlier load
     $('show-title').textContent = t.year ? `${t.name} (${t.year})` : t.name;
     $('show-poster').src = `${API_BASE}${t.poster}`;
     $('show-summary').textContent = `${state.lang} subtitles: ${t.done ?? 0} of ${t.total ?? 0} episodes`;
