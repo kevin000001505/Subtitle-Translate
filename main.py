@@ -89,6 +89,7 @@ TIME_OFFSET_MS = -500
 DAILY_LIMIT = 9500  
 LIMIT_HEADROOM = 100   # queued Gemini work starts only while more calls than this remain
 GAP_THRESHOLD_MS = 2000
+ECHO_MIN_CUES = 3      # unchanged lines needed before a partly unchanged file counts as echoed
 MAX_CHUNK_DURATION_MS = 120000 
 DB_FILE = "/app/data/queue.db"
 
@@ -587,9 +588,10 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     # translation only when every cue with visible English text gets
     # non-empty text (not merged, not blanked, not renumbered from 1); cues
     # with no visible text (empty, or styling only) may be left out. Single
-    # cues may stay the same ("OK", a name, "♪"), but a file where most
-    # visible cues come back unchanged was echoed, not translated. The
-    # legacy path still saves partial chunks.
+    # cues may stay the same ("OK", a name, "♪"), but a file where every
+    # visible cue, or most of them and at least ECHO_MIN_CUES, come back
+    # unchanged was echoed, not translated. The legacy path still saves
+    # partial chunks.
     usable = []
     visible = unchanged = 0
     for batch, raw_text in zip(chunks, results):
@@ -607,7 +609,8 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
             else:
                 outcome.unanswered_chunks += 1
     outcome.total_chunks = total_chunks
-    outcome.echoed = visible > 0 and unchanged * 2 > visible
+    outcome.echoed = visible > 0 and (unchanged == visible or
+                                      (unchanged >= ECHO_MIN_CUES and unchanged * 2 > visible))
     if require_all and (outcome.failed_chunks or outcome.echoed):
         problem = (f"{outcome.failed_chunks} of {total_chunks} chunks had no usable translation"
                    if outcome.failed_chunks else "the model returned most of the English unchanged")
@@ -922,9 +925,6 @@ async def run_translate_job(job, report) -> tuple[str, str]:
     if outcome.limit:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
-    if outcome.echoed:
-        return "failed", (f"{job['model']} returned most of the English unchanged; nothing was saved, "
-                          f"so it can be retried with another model")
     if outcome.failed_chunks:
         problems = []
         if outcome.unanswered_chunks:
@@ -933,6 +933,9 @@ async def run_translate_job(job, report) -> tuple[str, str]:
             problems.append(f"{outcome.unusable_chunks} of {outcome.total_chunks} chunks came back with missing, "
                             f"untranslated or no usable lines" + ("" if outcome.unanswered_chunks else f" from {job['model']}"))
         return "failed", "; ".join(problems) + "; nothing was saved, so it can be retried"
+    if outcome.echoed:
+        return "failed", (f"{job['model']} returned most of the English unchanged; nothing was saved, "
+                          f"so it can be retried with another model")
     return "failed", outcome.reason or f"Translation with {job['model']} failed"
 
 
