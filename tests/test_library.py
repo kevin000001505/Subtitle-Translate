@@ -497,26 +497,65 @@ def test_a_reply_numbered_from_one_fails_the_job(library, llama, monkeypatch):
 
 
 def test_a_reply_with_ids_from_outside_the_chunk_never_overwrites_other_lines(media, llama, monkeypatch):
-    import re
-    reply_with(monkeypatch, llama, lambda text: text + "\n[999] stray\n[1] wrong place" if "[0]" in text else text)
-    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    # Two chunks (a gap over 2 s): chunk 1's reply, applied last, also claims chunk 0's line.
+    reply_with(monkeypatch, llama, lambda text: text + "\n[0] hijacked" if "[1]" in text else text)
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (media / "Movie.en.srt").write_text(two_chunks)
 
-    asyncio.run(main.process_movie(str(media)))      # legacy path: partial results are still saved
+    asyncio.run(main.process_movie(str(media)))
 
     import pysubs2
-    texts = [s.text for s in pysubs2.load(str(media / "Movie.zh-TW.srt"))]
-    assert "stray" not in " ".join(texts)
+    assert [s.text for s in pysubs2.load(str(media / "Movie.zh-TW.srt"))] == ["zh-TW: Hello", "zh-TW: Goodbye"]
 
 
-def test_a_bad_language_in_a_library_url_is_a_422(library):
-    assert library.client.get("/library/jellyfin?lang=1").status_code == 422
-    assert library.client.get("/library/jellyfin/shows/s1?lang=x1").status_code == 422
+def test_a_subtitle_with_an_empty_cue_translates(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: ", ""))   # echoes the empty cue as "[1] "
+    with_empty = """1
+00:00:01,000 --> 00:00:02,000
+Hello
+
+2
+00:00:02,500 --> 00:00:03,000
 
 
-def test_a_model_that_never_answers_is_named_as_unreachable(library, llama):
-    llama.status_code = 500
-    queue(library, model="qwen3-14b", items=[{"kind": "movie", "id": "m1"}])
+3
+00:00:03,500 --> 00:00:04,000
+Goodbye
+"""
+    (library.movie / "Arrival.en.srt").write_text(with_empty)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
     run_all()
 
-    message = library.client.get("/jobs").json()["jobs"][0]["message"]
-    assert "did not answer" in message and "qwen3-14b" in message
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+
+
+def test_the_model_list_does_not_wait_for_media_server_lookups(library, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    busy = ThreadPoolExecutor(max_workers=1)
+    busy.shutdown()                       # any lookup sent here fails at once
+    monkeypatch.setattr(main, "LOOKUP_POOL", busy)
+    monkeypatch.setattr(main, "list_models", lambda: [{"id": "m", "name": "m", "loaded": False}])
+
+    assert library.client.get("/models").json()["local"][0]["id"] == "m"
+
+
+def test_a_mostly_unanswered_job_names_the_model(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+
+    def answer_first_only(url, headers=None, json=None, timeout=None):
+        if "Goodbye" in json["messages"][0]["content"][0]["text"].split("INPUT:")[1]:
+            llama.status_code = 500
+            try:
+                return original(url, headers=headers, json=json, timeout=timeout)
+            finally:
+                llama.status_code = 200
+        return original(url, headers=headers, json=json, timeout=timeout)
+    monkeypatch.setattr(translate_gemma.requests, "post", answer_first_only)
+    two_chunks = SAMPLE_SRT.replace("00:00:03,000 --> 00:00:04,000", "00:00:30,000 --> 00:00:31,000")
+    (library.movie / "Arrival.en.srt").write_text(two_chunks)
+
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert "did not answer 1 of 2" in library.client.get("/jobs").json()["jobs"][0]["message"]

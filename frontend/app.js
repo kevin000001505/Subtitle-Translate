@@ -296,6 +296,7 @@ async function openShow(t) {
         renderSeasons(body.seasons);
     } catch (e) {
         if (state.show !== t) return;
+        whole.disabled = !whole.checked;         // still lets a ticked show be unticked
         $('show-seasons').innerHTML = '';
         $('show-seasons').append(el('p', { className: 'muted', textContent: `Could not load episodes: ${e.message}` }));
     }

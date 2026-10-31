@@ -447,7 +447,7 @@ def get_progress_bar(current, total, length=20):
     return f"[{bar}] {int(percent * 100)}%"
 
 _ID_BLOCK_RE = re.compile(
-    r'\[(\d+)\]\s*(.*?)(?=(?:\r?\n)\s*\[\d+\]|\Z)',
+    r'\[(\d+)\][ \t]*(.*?)(?=(?:\r?\n)\s*\[\d+\]|\Z)',
     re.DOTALL,
 )
 
@@ -875,8 +875,12 @@ GEMINI_RETRY_SECONDS = 600
 _gemini_blocked_until = 0.0
 
 
+async def run_in(pool, fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
+
+
 async def in_lookup_pool(fn, *args):
-    return await asyncio.get_running_loop().run_in_executor(LOOKUP_POOL, fn, *args)
+    return await run_in(LOOKUP_POOL, fn, *args)
 
 
 async def run_translate_job(job, report) -> tuple[str, str]:
@@ -902,9 +906,9 @@ async def run_translate_job(job, report) -> tuple[str, str]:
     if outcome.limit:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
-    if outcome.unanswered_chunks == outcome.total_chunks > 0:
-        return "failed", (f"{job['model']} did not answer ({outcome.total_chunks} of {outcome.total_chunks} "
-                          f"chunks); nothing was saved, so it can be retried")
+    if outcome.unanswered_chunks:
+        return "failed", (f"{job['model']} did not answer {outcome.unanswered_chunks} of {outcome.total_chunks} "
+                          f"chunks; nothing was saved, so it can be retried")
     if outcome.failed_chunks:
         return "failed", (f"{outcome.failed_chunks} of {outcome.total_chunks} chunks came back with missing or "
                           f"no usable lines from {job['model']}; nothing was saved, so it can be retried")
@@ -1036,7 +1040,7 @@ def config_endpoint():
 async def models_endpoint():
     gemini = {"backend": "gemini", "id": GEMINI_MODEL, "name": f"Gemini ({GEMINI_MODEL})"} if client else None
     try:
-        local = await asyncio.get_running_loop().run_in_executor(MODELS_POOL, list_models)
+        local = await run_in(MODELS_POOL, list_models)
         error = None
     except (requests.RequestException, ValueError) as e:
         local, error = [], f"llama-swap is unreachable at {TRANSLATE_GEMMA_URL} ({type(e).__name__})"
@@ -1098,8 +1102,7 @@ async def show_endpoint(server_name: str, show_id: str, lang: LangCode = DEFAULT
 async def poster_endpoint(server_name: str, item_id: str):
     server = _server(server_name)
     try:
-        content, content_type = await asyncio.get_running_loop().run_in_executor(
-            POSTER_POOL, server.poster, item_id)
+        content, content_type = await run_in(POSTER_POOL, server.poster, item_id)
     except MediaServerError:
         raise HTTPException(404, "No poster")
     return Response(content, media_type=content_type, headers={"Cache-Control": "max-age=86400"})
