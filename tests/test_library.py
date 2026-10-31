@@ -662,7 +662,8 @@ def test_a_model_that_echoes_the_english_fails_the_job(library, llama, monkeypat
     queue(library, overwrite=True, items=[{"kind": "movie", "id": "m1"}])
     run_all()
 
-    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "English unchanged" in job["message"]
     assert (library.movie / "Arrival.zh-TW.srt").read_text() == "good translation"
 
 
@@ -688,6 +689,7 @@ def test_an_unanswered_chunk_of_empty_cues_never_gives_a_negative_count(library,
 
     message = library.client.get("/jobs").json()["jobs"][0]["message"]
     assert "-1" not in message and "1 of 2 chunks came back with missing" in message
+    assert "did not answer" not in message          # the unanswered chunk held only an empty cue
 
 
 def test_the_waiting_note_clears_when_the_limit_does(library, gemini, monkeypatch):
@@ -712,3 +714,82 @@ def test_the_waiting_note_never_replaces_another_message(library):
     jobs.note_waiting(main.DB_FILE, "gemini", "Waiting for Gemini's daily limit", False)
 
     assert jobs.get(main.DB_FILE, job["id"])["message"] == "Interrupted by a restart"
+
+
+def test_a_lone_cue_that_stays_the_same_in_translation_is_fine(library, llama, monkeypatch):
+    # "♪" more than 2 s from its neighbours is a chunk of its own; it stays "♪" in Chinese.
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: ♪", "♪"))
+    (library.movie / "Arrival.en.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:30,000 --> 00:00:31,000\n♪\n")
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    import pysubs2
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+    assert [s.text for s in pysubs2.load(str(library.movie / "Arrival.zh-TW.srt"))] == ["zh-TW: Hello", "♪"]
+
+
+def test_a_file_with_no_visible_text_is_not_reported_as_echoed(library):
+    (library.movie / "Arrival.en.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\n<i></i>\n")
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert "unchanged" not in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+
+def test_a_model_that_echoes_most_of_the_file_fails_the_job(library, llama, monkeypatch):
+    many = "".join(f"{i + 1}\n00:{i:02d}:00,000 --> 00:{i:02d}:01,000\nLine {i}\n\n" for i in range(20))
+    (library.movie / "Arrival.en.srt").write_text(many)
+    reply_with(monkeypatch, llama, lambda text: text if "Line 0" in text else text.replace("zh-TW: ", ""))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "unchanged" in job["message"]
+    assert not (library.movie / "Arrival.zh-TW.srt").exists()
+
+
+def test_a_file_with_a_small_majority_echoed_still_fails(library, llama, monkeypatch):
+    many = "".join(f"{i + 1}\n00:{i:02d}:00,000 --> 00:{i:02d}:01,000\nLine {i}\n\n" for i in range(20))
+    (library.movie / "Arrival.en.srt").write_text(many)
+    keep = {f"Line {i}" for i in range(9)}          # 9 translated, 11 echoed
+    reply_with(monkeypatch, llama,
+               lambda text: text if any(k + "\n" in text + "\n" for k in keep) else text.replace("zh-TW: ", ""))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert "unchanged" in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+
+def test_a_short_mostly_music_file_translates(library, llama, monkeypatch):
+    (library.movie / "Arrival.en.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n♪\n\n2\n00:00:10,000 --> 00:00:11,000\n♪\n\n"
+        "3\n00:00:20,000 --> 00:00:21,000\nHi\n")
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: ♪", "♪"))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+
+
+def test_failed_chunks_are_reported_ahead_of_an_echo(library, llama, monkeypatch):
+    many = "".join(f"{i + 1}\n00:{i:02d}:00,000 --> 00:{i:02d}:01,000\nLine {i}\n\n" for i in range(6))
+    (library.movie / "Arrival.en.srt").write_text(many)
+    reply_with(monkeypatch, llama,
+               lambda text: "no ids" if "Line 0" in text else text.replace("zh-TW: ", ""))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "1 of 6 chunks came back" in message
+
+
+def test_a_file_with_exactly_half_unchanged_translates(library, llama, monkeypatch):
+    many = "".join(f"{i + 1}\n00:{i:02d}:00,000 --> 00:{i:02d}:01,000\nLine {i}\n\n" for i in range(6))
+    (library.movie / "Arrival.en.srt").write_text(many)
+    reply_with(monkeypatch, llama,
+               lambda text: text.replace("zh-TW: ", "") if any(f"Line {i}" in text for i in (0, 1, 2)) else text)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
