@@ -559,3 +559,17 @@ def test_a_mostly_unanswered_job_names_the_model(library, llama, monkeypatch):
     run_all()
 
     assert "did not answer 1 of 2" in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+
+def test_a_bad_language_in_a_library_url_is_a_422(library):
+    assert library.client.get("/library/jellyfin?lang=1").status_code == 422
+    assert library.client.get("/library/jellyfin/shows/s1?lang=x1").status_code == 422
+
+
+def test_a_model_that_never_answers_is_named_as_unreachable(library, llama):
+    llama.status_code = 500
+    queue(library, model="qwen3-14b", items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "did not answer" in message and "qwen3-14b" in message
