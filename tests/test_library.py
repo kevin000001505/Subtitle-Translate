@@ -662,7 +662,8 @@ def test_a_model_that_echoes_the_english_fails_the_job(library, llama, monkeypat
     queue(library, overwrite=True, items=[{"kind": "movie", "id": "m1"}])
     run_all()
 
-    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    job = library.client.get("/jobs").json()["jobs"][0]
+    assert job["status"] == "failed" and "returned the English unchanged" in job["message"]
     assert (library.movie / "Arrival.zh-TW.srt").read_text() == "good translation"
 
 
@@ -688,6 +689,7 @@ def test_an_unanswered_chunk_of_empty_cues_never_gives_a_negative_count(library,
 
     message = library.client.get("/jobs").json()["jobs"][0]["message"]
     assert "-1" not in message and "1 of 2 chunks came back with missing" in message
+    assert "did not answer" not in message          # the unanswered chunk held only an empty cue
 
 
 def test_the_waiting_note_clears_when_the_limit_does(library, gemini, monkeypatch):
@@ -712,3 +714,24 @@ def test_the_waiting_note_never_replaces_another_message(library):
     jobs.note_waiting(main.DB_FILE, "gemini", "Waiting for Gemini's daily limit", False)
 
     assert jobs.get(main.DB_FILE, job["id"])["message"] == "Interrupted by a restart"
+
+
+def test_a_lone_cue_that_stays_the_same_in_translation_is_fine(library, llama, monkeypatch):
+    # "♪" more than 2 s from its neighbours is a chunk of its own; it stays "♪" in Chinese.
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: ♪", "♪"))
+    (library.movie / "Arrival.en.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:30,000 --> 00:00:31,000\n♪\n")
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    import pysubs2
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+    assert [s.text for s in pysubs2.load(str(library.movie / "Arrival.zh-TW.srt"))] == ["zh-TW: Hello", "♪"]
+
+
+def test_a_file_with_no_visible_text_is_not_reported_as_echoed(library):
+    (library.movie / "Arrival.en.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\n<i></i>\n")
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert "unchanged" not in library.client.get("/jobs").json()["jobs"][0]["message"]

@@ -66,6 +66,7 @@ class TranslationOutcome:
     failed_chunks: int = 0       # chunks whose reply lacked their exact [ID] lines
     unanswered_chunks: int = 0   # failed chunks the model never answered
     unusable_chunks: int = 0     # failed chunks it answered unusably
+    echoed: bool = False         # every visible cue came back as the English
     total_chunks: int = 0
     reason: str = ""             # why nothing was attempted
 
@@ -584,28 +585,33 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
 
     # A reply may only touch its own chunk's lines. It counts as a full
     # translation only when every cue with visible English text gets
-    # non-empty text (not merged, not blanked, not renumbered from 1) and
-    # the reply is not the English echoed back; cues with no visible text
-    # (empty, or styling only) may be left out. The legacy path still saves
-    # partial chunks.
+    # non-empty text (not merged, not blanked, not renumbered from 1); cues
+    # with no visible text (empty, or styling only) may be left out. Single
+    # cues may stay the same ("OK", a name, "♪"), but a file whose every
+    # visible cue comes back unchanged was echoed, not translated. The
+    # legacy path still saves partial chunks.
     usable = []
+    visible = unchanged = 0
     for batch, raw_text in zip(chunks, results):
         ids = {idx for idx, _ in batch}
         source = {idx: sub.text.strip() for idx, sub in batch if sub.plaintext.strip()}
         parsed = parse_gemini_response(raw_text) if raw_text else {}
         usable.append({i: t for i, t in parsed.items() if i in ids})
         translated = {i for i, t in parsed.items() if t.strip()}
-        echoed = bool(source) and all(parsed.get(i, "").strip() == text for i, text in source.items())
-        if not set(source) <= translated or echoed:
+        visible += len(source)
+        unchanged += sum(parsed.get(i, "").strip() == text for i, text in source.items())
+        if not set(source) <= translated:
             outcome.failed_chunks += 1
             if raw_text:
                 outcome.unusable_chunks += 1
             else:
                 outcome.unanswered_chunks += 1
     outcome.total_chunks = total_chunks
-    if require_all and outcome.failed_chunks:
-        logger.error(f"FAILED: {outcome.failed_chunks} of {total_chunks} chunks of {en_sub_path} "
-                     f"had no usable translation; nothing saved")
+    outcome.echoed = visible > 0 and unchanged == visible
+    if require_all and (outcome.failed_chunks or outcome.echoed):
+        problem = (f"{outcome.failed_chunks} of {total_chunks} chunks had no usable translation"
+                   if outcome.failed_chunks else "the model returned the English unchanged")
+        logger.error(f"FAILED: {en_sub_path}: {problem}; nothing saved")
         return outcome
 
     # Apply translations
@@ -916,6 +922,9 @@ async def run_translate_job(job, report) -> tuple[str, str]:
     if outcome.limit:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
+    if outcome.echoed and not outcome.failed_chunks:
+        return "failed", (f"{job['model']} returned the English unchanged; nothing was saved, "
+                          f"so it can be retried with another model")
     if outcome.failed_chunks:
         problems = []
         if outcome.unanswered_chunks:
