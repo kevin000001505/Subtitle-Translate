@@ -88,11 +88,14 @@ def update(db_file, job_id, **fields):
                      [fields[n] for n in names] + [job_id])
 
 
-def note_waiting(db_file, backend, message):
-    """Explain why queued jobs on backend are being held back."""
+def note_waiting(db_file, backend, note, waiting):
+    """While waiting, show note on queued jobs for backend that have no
+    message; once not waiting, take that note off again. Other messages are
+    left alone."""
+    old, new = ("", note) if waiting else (note, "")
     with _connect(db_file) as conn:
-        conn.execute("UPDATE jobs SET message = ? WHERE status = 'queued' AND backend = ? AND COALESCE(message, '') = ''",
-                     (message, backend))
+        conn.execute("UPDATE jobs SET message = ? WHERE status = 'queued' AND backend = ? AND COALESCE(message, '') = ?",
+                     (new, backend, old))
 
 
 def get(db_file, job_id) -> dict | None:

@@ -509,7 +509,7 @@ def test_a_reply_with_ids_from_outside_the_chunk_never_overwrites_other_lines(me
 
 
 def test_a_subtitle_with_an_empty_cue_translates(library, llama, monkeypatch):
-    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: ", ""))   # echoes the empty cue as "[1] "
+    reply_with(monkeypatch, llama, lambda text: text.replace("[1] zh-TW: ", "[1] "))   # echoes the empty cue as "[1] "
     with_empty = """1
 00:00:01,000 --> 00:00:02,000
 Hello
@@ -575,7 +575,7 @@ def test_a_model_that_never_answers_is_named_as_unreachable(library, llama):
     assert "did not answer" in message and "qwen3-14b" in message
 
 
-FIVE_CUES_WITH_EMPTY = """1
+THREE_CUES_WITH_EMPTY = """1
 00:00:01,000 --> 00:00:02,000
 Alpha
 
@@ -601,7 +601,7 @@ def test_a_blank_translation_of_a_real_line_fails_the_job(library, llama, monkey
 def test_a_reply_that_leaves_out_empty_cues_still_translates(library, llama, monkeypatch):
     import re
     reply_with(monkeypatch, llama, lambda text: re.sub(r"\[1\] zh-TW: \n?", "", text))
-    (library.movie / "Arrival.en.srt").write_text(FIVE_CUES_WITH_EMPTY)
+    (library.movie / "Arrival.en.srt").write_text(THREE_CUES_WITH_EMPTY)
     queue(library, items=[{"kind": "movie", "id": "m1"}])
     run_all()
 
@@ -634,7 +634,7 @@ def test_unanswered_and_unusable_chunks_are_both_reported(library, llama, monkey
     run_all()
 
     message = library.client.get("/jobs").json()["jobs"][0]["message"]
-    assert "did not answer 1 of 3" in message and "1 more came back" in message
+    assert "did not answer 1 of 3" in message and "1 of 3 chunks came back" in message
 
 
 def test_gemini_jobs_held_back_by_the_limit_say_why(library, gemini, monkeypatch):
@@ -644,3 +644,71 @@ def test_gemini_jobs_held_back_by_the_limit_say_why(library, gemini, monkeypatch
 
     job = library.client.get("/jobs").json()["jobs"][0]
     assert job["status"] == "queued" and "daily limit" in job["message"]
+
+
+def test_a_styling_only_cue_may_be_left_out(library, llama, monkeypatch):
+    import re
+    reply_with(monkeypatch, llama, lambda text: re.sub(r"\[1\][^\n]*\n?", "", text))
+    (library.movie / "Arrival.en.srt").write_text(THREE_CUES_WITH_EMPTY.replace("\n\n\n3", "\n<i></i>\n\n3"))
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "done"
+
+
+def test_a_model_that_echoes_the_english_fails_the_job(library, llama, monkeypatch):
+    reply_with(monkeypatch, llama, lambda text: text.replace("zh-TW: ", ""))
+    (library.movie / "Arrival.zh-TW.srt").write_text("good translation")
+    queue(library, overwrite=True, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    assert library.client.get("/jobs").json()["jobs"][0]["status"] == "failed"
+    assert (library.movie / "Arrival.zh-TW.srt").read_text() == "good translation"
+
+
+def test_an_unanswered_chunk_of_empty_cues_never_gives_a_negative_count(library, llama, monkeypatch):
+    import translate_gemma
+    original = llama.post
+    blank_then_line = "1\n00:00:01,000 --> 00:00:02,000\n\n\n2\n00:00:30,000 --> 00:00:31,000\nHello\n"
+    (library.movie / "Arrival.en.srt").write_text(blank_then_line)
+
+    def first_unanswered(url, headers=None, json=None, timeout=None):
+        if "Hello" not in json["messages"][0]["content"][0]["text"].split("INPUT:")[1]:
+            llama.status_code = 500
+            try:
+                return original(url, headers=headers, json=json, timeout=timeout)
+            finally:
+                llama.status_code = 200
+        response = original(url, headers=headers, json=json, timeout=timeout)
+        response._content = "no ids"
+        return response
+    monkeypatch.setattr(translate_gemma.requests, "post", first_unanswered)
+    queue(library, items=[{"kind": "movie", "id": "m1"}])
+    run_all()
+
+    message = library.client.get("/jobs").json()["jobs"][0]["message"]
+    assert "-1" not in message and "1 of 2 chunks came back with missing" in message
+
+
+def test_the_waiting_note_clears_when_the_limit_does(library, gemini, monkeypatch):
+    used = {"calls": main.DAILY_LIMIT}
+    monkeypatch.setattr(main, "get_calls_last_24h", lambda: used["calls"])
+    queue(library, backend="gemini", model="g", items=[{"kind": "movie", "id": "m1"}])
+    asyncio.run(main.run_next_job())
+    assert "daily limit" in library.client.get("/jobs").json()["jobs"][0]["message"]
+
+    used["calls"] = 0
+    monkeypatch.setattr(main.jobs, "claim_next", lambda db, skip=(): None)   # still behind other work
+    asyncio.run(main.run_next_job())
+
+    assert library.client.get("/jobs").json()["jobs"][0]["message"] == ""
+
+
+def test_the_waiting_note_never_replaces_another_message(library):
+    job, _ = jobs.add(main.DB_FILE, op="translate", video_path="/v.mkv", target_lang="ja", backend="gemini", model="g")
+    jobs.update(main.DB_FILE, job["id"], message="Interrupted by a restart")
+
+    jobs.note_waiting(main.DB_FILE, "gemini", "Waiting for Gemini's daily limit", True)
+    jobs.note_waiting(main.DB_FILE, "gemini", "Waiting for Gemini's daily limit", False)
+
+    assert jobs.get(main.DB_FILE, job["id"])["message"] == "Interrupted by a restart"

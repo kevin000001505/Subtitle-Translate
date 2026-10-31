@@ -64,7 +64,8 @@ class TranslationOutcome:
     ok: bool = False
     limit: bool = False          # stopped at the Gemini daily limit
     failed_chunks: int = 0       # chunks whose reply lacked their exact [ID] lines
-    unanswered_chunks: int = 0   # chunks the model never answered
+    unanswered_chunks: int = 0   # failed chunks the model never answered
+    unusable_chunks: int = 0     # failed chunks it answered unusably
     total_chunks: int = 0
     reason: str = ""             # why nothing was attempted
 
@@ -582,19 +583,25 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     results = await asyncio.gather(*tasks)
 
     # A reply may only touch its own chunk's lines. It counts as a full
-    # translation only when every cue with English text gets non-empty text
-    # (not merged, not blanked, not renumbered from 1); cues that are empty
-    # in English may be left out. The legacy path still saves partial chunks.
+    # translation only when every cue with visible English text gets
+    # non-empty text (not merged, not blanked, not renumbered from 1) and
+    # the reply is not the English echoed back; cues with no visible text
+    # (empty, or styling only) may be left out. The legacy path still saves
+    # partial chunks.
     usable = []
     for batch, raw_text in zip(chunks, results):
         ids = {idx for idx, _ in batch}
-        needed = {idx for idx, sub in batch if sub.text.strip()}
+        source = {idx: sub.text.strip() for idx, sub in batch if sub.plaintext.strip()}
         parsed = parse_gemini_response(raw_text) if raw_text else {}
-        outcome.unanswered_chunks += not raw_text
         usable.append({i: t for i, t in parsed.items() if i in ids})
         translated = {i for i, t in parsed.items() if t.strip()}
-        if not needed <= translated:
+        echoed = bool(source) and all(parsed.get(i, "").strip() == text for i, text in source.items())
+        if not set(source) <= translated or echoed:
             outcome.failed_chunks += 1
+            if raw_text:
+                outcome.unusable_chunks += 1
+            else:
+                outcome.unanswered_chunks += 1
     outcome.total_chunks = total_chunks
     if require_all and outcome.failed_chunks:
         logger.error(f"FAILED: {outcome.failed_chunks} of {total_chunks} chunks of {en_sub_path} "
@@ -909,14 +916,14 @@ async def run_translate_job(job, report) -> tuple[str, str]:
     if outcome.limit:
         _gemini_blocked_until = time.time() + GEMINI_RETRY_SECONDS
         return "queued", "Waiting for Gemini's daily limit"
-    if outcome.unanswered_chunks:
-        unusable = outcome.failed_chunks - outcome.unanswered_chunks
-        also = f"; {unusable} more came back with missing or no usable lines" if unusable else ""
-        return "failed", (f"{job['model']} did not answer {outcome.unanswered_chunks} of {outcome.total_chunks} "
-                          f"chunks{also}; nothing was saved, so it can be retried")
     if outcome.failed_chunks:
-        return "failed", (f"{outcome.failed_chunks} of {outcome.total_chunks} chunks came back with missing or "
-                          f"no usable lines from {job['model']}; nothing was saved, so it can be retried")
+        problems = []
+        if outcome.unanswered_chunks:
+            problems.append(f"{job['model']} did not answer {outcome.unanswered_chunks} of {outcome.total_chunks} chunks")
+        if outcome.unusable_chunks:
+            problems.append(f"{outcome.unusable_chunks} of {outcome.total_chunks} chunks came back with missing, "
+                            f"untranslated or no usable lines" + ("" if outcome.unanswered_chunks else f" from {job['model']}"))
+        return "failed", "; ".join(problems) + "; nothing was saved, so it can be retried"
     return "failed", outcome.reason or f"Translation with {job['model']} failed"
 
 
@@ -951,8 +958,7 @@ async def run_next_job() -> bool:
     was runnable. Gemini jobs wait while the daily limit is (nearly) used up."""
     gemini_waits = time.time() < _gemini_blocked_until or (DAILY_LIMIT - get_calls_last_24h()) <= LIMIT_HEADROOM
     skip = ("gemini",) if gemini_waits else ()
-    if gemini_waits:
-        jobs.note_waiting(DB_FILE, "gemini", "Waiting for Gemini's daily limit")
+    jobs.note_waiting(DB_FILE, "gemini", "Waiting for Gemini's daily limit", gemini_waits)
     job = jobs.claim_next(DB_FILE, skip)
     if job is None:
         return False
