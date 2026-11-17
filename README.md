@@ -44,11 +44,13 @@ git pull
 docker compose up -d
 ```
 
+Add `--build` when the Dockerfile or the Python dependencies changed: `up -d` alone reuses the existing backend image.
+
 **Why in-place matters.** The frontend service bind-mounts the `frontend/` folder from the host as its web root, and the backend bind-mounts `queue_data/` (the job queue). If a redeploy re-copies the project tree (a fresh-copy deploy), those directories are **replaced**. The running containers keep their mounts to the old directories — a **stale bind mount**. The host tree looks correct, but the frontend service serves an empty web root: without `index.html`, `/` is a 403 (directory index forbidden) and the fallback rule returns 500 for missing files. The container stays "Up", so `docker ps` shows nothing. An in-place `git pull` updates file contents in place and never replaces a directory, so this cannot happen.
 
 ## Web root check and restart policy
 
-- **Web root check.** On every start of the frontend service, the service runs `check-webroot.sh` against its web root before nginx starts. The check validates only `index.html`, so it passes even while other assets are mid-copy during an update. If `index.html` is missing, the service **exits** with a non-zero status, and its log carries a message that names the missing file and the directory it expects (visible via `docker ps` and `docker logs frontend`). A stale web root therefore fails loudly instead of serving 403s silently.
+- **Web root check.** On every start of the frontend service, the service runs `check-webroot.sh` against its web root before nginx starts. The check validates only `index.html`, so it passes even while other assets are mid-copy during an update. If `index.html` is missing, the service **exits** with a non-zero status, and its log carries a message that names the missing file and the directory it expects. A stale web root therefore fails loudly instead of serving 403s silently. Because the restart policy restarts it, `docker ps` shows the service as `Restarting`, not `Exited`; `docker logs frontend` carries the reason.
 - **Known limitation.** The check runs at start. A directory that is replaced while the container is running (a fresh-copy deploy) is caught at the next (re)start, not immediately. Until then the container keeps serving the old, empty web root.
 - **Restart policy.** Both services run with `restart: unless-stopped`: they start automatically when the host reboots, and a crashed service restarts on its own, but a service you stopped stays stopped.
 
@@ -67,4 +69,5 @@ If the frontend service is serving an empty web root because a deploy replaced `
 ## Notes
 
 - `docker-compose.override.yml` (applied automatically by `docker compose`) live-mounts the backend modules for development.
-- The nginx configuration is not changed by a `git pull`; only the frontend files are bind-mounted, so the web UI can be edited on the host without rebuilding an image.
+- The frontend service bind-mounts `frontend/` as its web root, and `frontend/nginx.conf` as `/etc/nginx/nginx.conf`, both read-only. You can edit the web UI on the host without rebuilding an image.
+- The same web root mount exposes every file under `frontend/` as a static file, so `http://<server>:8081/nginx.conf` and `/check-webroot.sh` are also downloadable. Nothing secret lives in either file.
