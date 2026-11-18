@@ -33,7 +33,8 @@ def test_the_compose_wires_the_webroot_check_and_restart_policies():
     assert "restart: unless-stopped" in frontend
 
     # The check script is mounted read-only at a path outside the web root,
-    # so it is not publicly served.
+    # so nginx never executes a file it serves. (The ./frontend web root
+    # mount still exposes the script itself as a static file: see README.)
     mount = re.search(r"^\s*- \./frontend/check-webroot\.sh:([\w./-]+):ro\s*$", frontend, re.M)
     assert mount and not mount.group(1).startswith("/usr/share/nginx/html")
 
@@ -50,3 +51,5 @@ def test_the_compose_wires_the_webroot_check_and_restart_policies():
     program = items[2]
     assert program.index("check-webroot.sh") < program.index("&&") < program.index("nginx")
     assert "docker-entrypoint.sh" in program
+    # nginx runs in the foreground, so it stays the container's main process.
+    assert "daemon off;" in program

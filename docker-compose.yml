@@ -28,7 +28,9 @@ services:
     volumes:
       - ./frontend/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./frontend:/usr/share/nginx/html:ro
-      # The check runs from a path outside the web root.
+      # nginx runs the check from a path outside the web root. Note: the
+      # ./frontend web root mount above also exposes this file (and
+      # nginx.conf) as static files under /check-webroot.sh and /nginx.conf.
       - ./frontend/check-webroot.sh:/usr/local/bin/check-webroot.sh:ro
     depends_on:
       - backend
