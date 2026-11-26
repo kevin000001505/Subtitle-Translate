@@ -22,7 +22,8 @@ import requests
 from pydantic import model_validator
 import jobs
 from media_servers import MediaServerError, configured_servers
-from translate_gemma import TRANSLATE_GEMMA_MODEL, TRANSLATE_GEMMA_URL, TranslateGemmaClient, list_models
+from translate_gemma import (TRANSLATE_GEMMA_MODEL, TranslateGemmaClient, list_models,
+                             models_url as llama_swap_models_url)
 from subtitle_files import (DEFAULT_TARGET_LANG, LANGUAGES, SOURCE_LANG, canonical_lang, is_source_subtitle,
                             output_subtitle_path, sidecar_subtitle_path, strip_source_suffix,
                             subtitle_suffix)
@@ -1068,7 +1069,9 @@ async def models_endpoint():
         local = await run_in(MODELS_POOL, list_models)
         error = None
     except (requests.RequestException, ValueError) as e:
-        local, error = [], f"llama-swap is unreachable at {TRANSLATE_GEMMA_URL} ({type(e).__name__})"
+        response = getattr(e, "response", None)
+        detail = f"HTTP {response.status_code}" if response is not None else type(e).__name__
+        local, error = [], f"llama-swap did not answer at {llama_swap_models_url()} ({detail})"
     return {"local": [{"backend": "llama-swap", **m} for m in local], "local_error": error, "gemini": gemini}
 
 

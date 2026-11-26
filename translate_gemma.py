@@ -19,17 +19,38 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 def uses_translategemma_prompt(model: str) -> bool:
     """TranslateGemma needs its structured request (language codes beside the
-    text); every other model gets a plain chat prompt. The configured default
-    model is TranslateGemma by definition of TRANSLATE_GEMMA_MODEL."""
-    return "translategemma" in model.lower() or model == TRANSLATE_GEMMA_MODEL
+    text); every other model gets a plain chat prompt. TranslateGemma builds
+    carry "translate" and "gemma" in their name, which covers the usual
+    default (translatemgemma). A default that names another model, such as a
+    Qwen build, gets the plain chat prompt."""
+    name = model.lower()
+    return "translate" in name and "gemma" in name
+
+
+def base_url() -> str:
+    """llama-swap's OpenAI-compatible root, with any trailing /v1 removed.
+
+    An operator who copies the URL from Open WebUI writes it with /v1 at the
+    end. The requests below add /v1/models and /v1/chat/completions
+    themselves, so such a base asks llama-swap for /v1/v1/models, and
+    llama-swap answers 404."""
+    url = TRANSLATE_GEMMA_URL.rstrip("/")
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")].rstrip("/")
+    return url
+
+
+def models_url() -> str:
+    """The exact URL list_models asks for. main.py names it in its error."""
+    return f"{base_url()}/v1/models"
 
 
 def list_models(http=requests) -> list[dict]:
     """The models llama-swap serves, from its OpenAI-compatible
     GET /v1/models (the list Open WebUI reads). Alias entries are left out so
     each model appears once. Raises requests.RequestException when llama-swap
-    can't be reached."""
-    response = http.get(f"{TRANSLATE_GEMMA_URL.rstrip('/')}/v1/models",
+    does not answer."""
+    response = http.get(models_url(),
                         headers={"Authorization": f"Bearer {TRANSLATE_GEMMA_API_KEY}"}, timeout=5)
     response.raise_for_status()
     models = []
@@ -47,7 +68,7 @@ def list_models(http=requests) -> list[dict]:
 
 class TranslateGemmaClient:
     def __init__(self):
-        self.base_url = TRANSLATE_GEMMA_URL.rstrip("/")
+        self.base_url = base_url()
         self.api_key = TRANSLATE_GEMMA_API_KEY
         self.headers = {
             "Content-Type": "application/json",

@@ -202,7 +202,24 @@ def test_models_report_an_unreachable_llama_swap(library, monkeypatch):
 
     body = library.client.get("/models").json()
 
-    assert body["local"] == [] and "unreachable" in body["local_error"] and body["gemini"] is None
+    error = body["local_error"]
+    assert body["local"] == [] and body["gemini"] is None
+    assert "http://localhost:8080/v1/models" in error and "ConnectionError" in error
+
+
+def test_models_name_the_http_status_when_llama_swap_answers_the_wrong_path(library, monkeypatch):
+    import requests
+
+    def wrong_path():
+        response = requests.Response()
+        response.status_code = 404
+        raise requests.HTTPError("404 page not found", response=response)
+    monkeypatch.setattr(main, "list_models", wrong_path)
+
+    body = library.client.get("/models").json()
+
+    error = body["local_error"]
+    assert body["local"] == [] and "HTTP 404" in error and "/v1/models" in error
 
 
 def test_config_lists_servers_and_languages(library):
