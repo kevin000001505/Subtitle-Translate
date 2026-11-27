@@ -1,5 +1,6 @@
 import asyncio
 import os
+import pathlib
 import shutil
 import subprocess
 import re
@@ -318,68 +319,108 @@ def short_media_wait(monkeypatch):
 
 
 class StalledMediaFolder:
-    """File checks under root wait on an event until the test releases the stall.
+    """File checks and file opens under root wait on an event until the test
+    releases the stall.
 
-    install() holds them only in the module it patches, and only for paths under
-    root, so nothing else in the test is affected. A test must not touch a file
-    under root while the stall is active: its own file check would wait too.
+    install() holds the patched module's own `os` / `os.path` checks, and every
+    file open (through `pathlib.Path.open`, which is how pysubs2 reads and writes
+    a subtitle), for paths under root only, so nothing else in the test is
+    affected. A stalled mount blocks reads and writes the same way it blocks an
+    existence check, so a test that looks for "no media-folder file access on the
+    event loop" has to see both. stall(checks=False) or stall(opens=False) holds
+    one kind only, which lets a flow reach the phase a test means to look at.
+
+    A test must not touch a file under root while the stall is active: its own
+    file check or write would wait too.
     """
 
     def __init__(self, root):
         self.root = os.path.abspath(str(root))
-        self.checks = 0                 # held file checks seen, stalled or not
+        self.checks = 0                 # held file accesses seen (checks and opens)
         self.check_threads = set()      # names of the threads that made them
-        self._stalled = threading.Event()
+        # A stalled mount holds a file check and a file open apart from each
+        # other, so a test can stall one kind only and let a flow reach the phase
+        # it means to test (a subtitle read, past the folder listing).
+        self._stalled = {"check": threading.Event(), "open": threading.Event()}
         self._stuck = threading.Event()
 
-    def stall(self):
-        """The media folder stops answering."""
-        self._stalled.set()
+    def stall(self, checks=True, opens=True):
+        """The media folder stops answering.
+
+        stall() holds every media-folder file access. stall(checks=False) holds
+        only the opens, so a flow gets past its folder listing and is left sitting
+        on the subtitle it reads or writes; stall(opens=False) holds only the
+        checks.
+        """
+        if checks:
+            self._stalled["check"].set()
+        if opens:
+            self._stalled["open"].set()
 
     def release(self):
         """The media folder answers again."""
-        self._stalled.clear()
+        for event in self._stalled.values():
+            event.clear()
         self._stuck.clear()
 
     def reset_checks(self):
-        """Count the file checks made after this call."""
+        """Count the file accesses made after this call."""
         self.checks = 0
         self.check_threads.clear()
 
     def wait_until_stuck(self, timeout) -> bool:
-        """Whether a file check is waiting on the stalled media folder."""
+        """Whether a file access is waiting on the stalled media folder."""
         return self._stuck.wait(timeout)
 
     def _under_root(self, path) -> bool:
         target = os.path.abspath(str(path))
         return target == self.root or target.startswith(self.root + os.sep)
 
-    def hold(self, path):
-        """Record the check, then wait here while the media folder is stalled
-        and path is under root."""
+    def hold(self, path, kind="check"):
+        """Record the file access, then wait here while the media folder is
+        stalled for that kind of access and path is under root."""
         if not self._under_root(path):
             return
         self.checks += 1
         self.check_threads.add(threading.current_thread().name)
-        if not self._stalled.is_set():
+        stalled = self._stalled[kind]
+        if not stalled.is_set():
             return
         self._stuck.set()
-        while self._stalled.is_set():
-            self._stalled.wait(0.05)
+        while stalled.is_set():
+            stalled.wait(0.05)
 
     def install(self, monkeypatch, module=main):
-        """Give module an `os` that holds the file checks under root.
+        """Give module an `os` that holds the file checks under root, and hold
+        file opens under root.
 
         Patching the real os module instead would hold pytest's own file checks
         too: building a failure report resolves paths, and each of those calls
         would then wait on the stall.
         """
         monkeypatch.setattr(module, "os", _StalledOS(self))
+        monkeypatch.setattr(pathlib.Path, "open", _held_path_open(self), raising=False)
 
 
 # The file checks the backend makes on the media folder.
 OS_CHECKS = ("listdir", "stat")
 PATH_CHECKS = ("exists", "isdir", "isfile")
+_REAL_PATH_OPEN = pathlib.Path.open
+
+
+def _held_path_open(stall: StalledMediaFolder):
+    """A `pathlib.Path.open` that waits on the stalled media folder.
+
+    A file open is how a subtitle is read or written, so it has to wait on the
+    folder like an existence check does. A plain function is a descriptor, so
+    installed as Path.open it receives the Path instance like the real one does.
+    """
+
+    def held(path, *args, **kwargs):
+        stall.hold(path, "open")
+        return _REAL_PATH_OPEN(path, *args, **kwargs)
+
+    return held
 
 
 class _StalledView:
