@@ -104,6 +104,23 @@ def _by_episode(episodes):
 # kind each one holds. _libraries_by_kind says why every other type is skipped.
 JELLYFIN_LIBRARY_TYPES = {"movies": "movie", "tvshows": "show"}
 
+# The item type each title kind holds. Jellyfin answers a library with items of
+# other types as well: with "group movies into collections" on, the Movies
+# library also returns BoxSet items, even though the request asks for
+# IncludeItemTypes=Movie. The item's own Type decides what becomes a title.
+JELLYFIN_TITLE_TYPES = {"movie": "Movie"}
+
+
+def _type_matches(item, expected: str | None) -> bool:
+    """Whether Jellyfin says this item is the type being read.
+
+    An item whose Type is absent is kept: /Items always reports Type in real
+    Jellyfin, and a lookup that asks for no type leaves the field out.
+    """
+    actual = item.get("Type")
+    return expected is None or not actual or actual == expected
+
+
 
 class Jellyfin(_Server):
     name = "jellyfin"
@@ -164,6 +181,8 @@ class Jellyfin(_Server):
                     "SortOrder": "Ascending",
                 })
                 for item in data.get("Items", []):
+                    if not _type_matches(item, JELLYFIN_TITLE_TYPES.get(kind)):
+                        continue
                     server_path = item.get("Path") if kind == "movie" else None
                     titles.setdefault(item["Id"], Title(
                         id=item["Id"], kind=kind, name=item.get("Name", ""),

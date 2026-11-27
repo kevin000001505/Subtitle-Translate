@@ -187,6 +187,13 @@ JELLYFIN_ITEMS = {"Items": [
      "Path": "/data/JellyBridge/Elsewhere.mkv", "ParentId": "lib-movies"},
     {"Id": "s1", "Name": "Severance", "Type": "Series", "ProductionYear": 2022,
      "ParentId": "lib-shows"},
+    # "group movies into collections" is on: Jellyfin answers the Movies
+    # library with collection items too, even though the request asks for
+    # IncludeItemTypes=Movie. Their path is a folder in Jellyfin's own config,
+    # so no path-map rule covers it.
+    {"Id": "bx1", "Name": "Along with the Gods Collection", "Type": "BoxSet",
+     "ProductionYear": None, "Path": "/data/collections/Along with the Gods Collection",
+     "ParentId": "lib-movies"},
     {"Id": "d1", "Name": "Dune", "Type": "Movie", "ProductionYear": 2021,
      "Path": "/data/JellyBridge/Discover/Dune (2021)/Dune.mkv", "ParentId": "lib-discover"},
     {"Id": "c1", "Name": "Blade Runner Collection", "Type": "BoxSet",
