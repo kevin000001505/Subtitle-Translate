@@ -3,8 +3,11 @@ import os
 import shutil
 import subprocess
 import re
+import threading
 
+import httpx
 import pytest
+
 
 # The app reads these at import time. Clear them so the suite runs against
 # the code defaults, never against a developer's shell or .env (and never
@@ -15,6 +18,8 @@ for _name in ("GEMINI_API_KEY", "GEMINI_MODEL", "TRANSLATOR_BACKEND",
 
 import main  # noqa: E402
 import translate_gemma  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from media_servers import Jellyfin, PathMap  # noqa: E402
 
 SAMPLE_SRT = """1
 00:00:01,000 --> 00:00:02,000
@@ -144,6 +149,7 @@ def make_mkv(tmp_path):
     return make
 
 
+
 class FakeHttp:
     """Stands in for requests.Session against a media server: routes map
     (METHOD, path) to a JSON body, bytes, or an HTTP status code."""
@@ -258,3 +264,203 @@ class FakeJellyfinHttp(FakeHttp):
             items = [item for item in body["Items"] if not parent or item.get("ParentId") == parent]
             self.routes[("GET", "/Items")] = {"Items": items, "TotalRecordCount": len(items)}
         return super().request(method, url, params, headers, timeout)
+
+
+@pytest.fixture
+def library(tmp_path, monkeypatch, llama):
+    """The backend with a Jellyfin server and a real media folder on disk.
+
+    The media folder is the temporary root's "lib" folder: the file checks the
+    badges make run against real files, and StalledMediaFolder can hold them."""
+    root = tmp_path / "lib"
+    movie = root / "Movies" / "Arrival (2016)"
+    show = root / "TV" / "Severance"
+    movie.mkdir(parents=True)
+    show.mkdir(parents=True)
+    for video in (movie / "Arrival.mkv", show / "S01E01.mkv", show / "S01E02.mkv"):
+        video.write_bytes(b"")
+        video.with_suffix(".en.srt").write_text(SAMPLE_SRT)
+    http = FakeJellyfinHttp(jellyfin_routes())
+    server = Jellyfin("http://jf:8096", "secret-key", PathMap(f"/data/media:{root}"), http)
+    monkeypatch.setattr(main, "SERVERS", {"jellyfin": server})
+    monkeypatch.setattr(main, "_library_cache", {})
+    monkeypatch.setattr(main, "_gemini_blocked_until", 0.0)
+
+    class Library:
+        pass
+    lib = Library()
+    lib.root, lib.movie, lib.show, lib.http, lib.client = root, movie, show, http, TestClient(main.app)
+    return lib
+
+
+# ---------- stalled media folder harness ----------
+# Production mounts the media folder (/media) as a hard NFS mount: a file check
+# on it can wait forever, it never fails by itself, and a thread that waits
+# there cannot be cancelled. These helpers hold the file checks a request makes
+# under a test library root until the test releases them, and drive the backend
+# through one event loop, as uvicorn does.
+
+REQUEST_DEADLINE_SECONDS = 3.0      # a test waits this long for one request
+SCENARIO_DEADLINE_SECONDS = 12.0    # ... and this long for a whole scenario
+
+
+class StalledMediaFolder:
+    """File checks under root wait on an event until the test releases the stall.
+
+    install() holds them only in the module it patches, and only for paths under
+    root, so nothing else in the test is affected. A test must not touch a file
+    under root while the stall is active: its own file check would wait too.
+    """
+
+    def __init__(self, root):
+        self.root = os.path.abspath(str(root))
+        self.checks = 0                 # held file checks seen, stalled or not
+        self.check_threads = set()      # names of the threads that made them
+        self._stalled = threading.Event()
+        self._stuck = threading.Event()
+
+    def stall(self):
+        """The media folder stops answering."""
+        self._stalled.set()
+
+    def release(self):
+        """The media folder answers again."""
+        self._stalled.clear()
+        self._stuck.clear()
+
+    def reset_checks(self):
+        """Count the file checks made after this call."""
+        self.checks = 0
+        self.check_threads.clear()
+
+    def wait_until_stuck(self, timeout) -> bool:
+        """Whether a file check is waiting on the stalled media folder."""
+        return self._stuck.wait(timeout)
+
+    def _under_root(self, path) -> bool:
+        target = os.path.abspath(str(path))
+        return target == self.root or target.startswith(self.root + os.sep)
+
+    def hold(self, path):
+        """Record the check, then wait here while the media folder is stalled
+        and path is under root."""
+        if not self._under_root(path):
+            return
+        self.checks += 1
+        self.check_threads.add(threading.current_thread().name)
+        if not self._stalled.is_set():
+            return
+        self._stuck.set()
+        while self._stalled.is_set():
+            self._stalled.wait(0.05)
+
+    def install(self, monkeypatch, module=main):
+        """Give module an `os` that holds the file checks under root.
+
+        Patching the real os module instead would hold pytest's own file checks
+        too: building a failure report resolves paths, and each of those calls
+        would then wait on the stall.
+        """
+        monkeypatch.setattr(module, "os", _StalledOS(self))
+
+
+# The file checks the backend makes on the media folder.
+OS_CHECKS = ("listdir", "stat")
+PATH_CHECKS = ("exists", "isdir", "isfile")
+
+
+class _StalledView:
+    """A stand-in for os or os.path.
+
+    The checks in held_names wait for a path under the stall's root; every other
+    attribute (join, getenv, chmod, ...) is the real one.
+    """
+
+    def __init__(self, owner, held_names, stall):
+        self._owner = owner
+        self._held = frozenset(held_names)
+        self._stall = stall
+
+    def __getattr__(self, name):
+        call = getattr(self._owner, name)
+        if name not in self._held:
+            return call
+
+        def held(path, *args, **kwargs):
+            self._stall.hold(path)
+            return call(path, *args, **kwargs)
+
+        return held
+
+
+class _StalledOS(_StalledView):
+    """The os module, and its path submodule, as a stalled media folder sees them."""
+
+    def __init__(self, stall: StalledMediaFolder):
+        super().__init__(os, OS_CHECKS, stall)
+        self.path = _StalledView(os.path, PATH_CHECKS, stall)
+
+
+@pytest.fixture
+def media_stall(monkeypatch, library):
+    """The library fixture, with the backend's media folder able to stall.
+
+    The stall holds main.py's file checks for paths under the library root. It
+    is released at teardown, so a scenario that gave up cannot hang the suite."""
+    stalled = StalledMediaFolder(library.root)
+    stalled.install(monkeypatch)
+    yield stalled
+    stalled.release()
+
+
+def asgi_client(app=main.app) -> httpx.AsyncClient:
+    """An async HTTP client over the ASGI app, so every request shares one event
+    loop as in production.
+
+    Not TestClient: used without `with` it gives each request its own event loop,
+    so a stall would look harmless. The ASGI transport does not run the lifespan,
+    so the legacy queue monitor never starts (it spins while asyncio.sleep is a
+    no-op, as the autouse fixture replaces it).
+    """
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://backend")
+
+
+async def request_within(client, method, path, timeout=REQUEST_DEADLINE_SECONDS, **kwargs):
+    """One request with a deadline, so a stalled backend fails the test instead
+    of hanging it."""
+    return await asyncio.wait_for(client.request(method, path, **kwargs), timeout)
+
+
+async def media_folder_is_stuck(stalled: StalledMediaFolder,
+                                timeout=REQUEST_DEADLINE_SECONDS) -> bool:
+    """Wait in a worker thread for a file check to reach the stalled media folder.
+
+    Waiting here would hold the event loop the test is driving, which is exactly
+    the failure these tests look for.
+    """
+    return await asyncio.wait_for(asyncio.to_thread(stalled.wait_until_stuck, timeout), timeout)
+
+
+def run_scenario(coro, deadline=SCENARIO_DEADLINE_SECONDS):
+    """Run an async scenario on its own event loop, in a worker thread.
+
+    A request that blocks the event loop never returns, so the deadline is kept
+    outside that loop: the test fails when the scenario is still running past it.
+    """
+    outcome = {}
+
+    def worker():
+        try:
+            outcome["value"] = asyncio.run(coro)
+        except BaseException as exc:      # reported to the test, not swallowed
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, name="scenario", daemon=True)
+    thread.start()
+    thread.join(deadline)
+    if thread.is_alive():
+        raise AssertionError(
+            f"the backend did not answer within {deadline} s: a request blocked the event loop")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")

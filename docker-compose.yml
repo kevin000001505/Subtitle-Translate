@@ -3,6 +3,8 @@ services:
     build: .
     # Every value comes from .env (see .env.example); the defaults match the code's.
     environment:
+      # The media folder has its own timeout, below the frontend proxy's 60 s.
+      - MEDIA_FOLDER_TIMEOUT_SECONDS=${MEDIA_FOLDER_TIMEOUT_SECONDS:-20}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
       - TRANSLATOR_BACKEND=${TRANSLATOR_BACKEND:-translatemgemma}

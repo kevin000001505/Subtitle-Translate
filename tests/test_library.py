@@ -1,36 +1,9 @@
 import asyncio
 import subprocess
 
-import pytest
-from fastapi.testclient import TestClient
-
 import jobs
 import main
-from conftest import SAMPLE_SRT, FakeJellyfinHttp, jellyfin_routes
-from media_servers import Jellyfin, PathMap
-
-
-@pytest.fixture
-def library(tmp_path, monkeypatch, llama):
-    root = tmp_path / "lib"
-    movie = root / "Movies" / "Arrival (2016)"
-    show = root / "TV" / "Severance"
-    movie.mkdir(parents=True)
-    show.mkdir(parents=True)
-    for video in (movie / "Arrival.mkv", show / "S01E01.mkv", show / "S01E02.mkv"):
-        video.write_bytes(b"")
-        video.with_suffix(".en.srt").write_text(SAMPLE_SRT)
-    http = FakeJellyfinHttp(jellyfin_routes())
-    server = Jellyfin("http://jf:8096", "secret-key", PathMap(f"/data/media:{root}"), http)
-    monkeypatch.setattr(main, "SERVERS", {"jellyfin": server})
-    monkeypatch.setattr(main, "_library_cache", {})
-    monkeypatch.setattr(main, "_gemini_blocked_until", 0.0)
-
-    class Library:
-        pass
-    lib = Library()
-    lib.root, lib.movie, lib.show, lib.http, lib.client = root, movie, show, http, TestClient(main.app)
-    return lib
+from conftest import SAMPLE_SRT
 
 
 def statuses(lib, lang="zh-TW"):

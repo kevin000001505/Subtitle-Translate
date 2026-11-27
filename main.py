@@ -10,6 +10,7 @@ import logging
 import sqlite3
 import time
 import asyncio
+import functools
 import re
 import json
 import uuid
@@ -161,29 +162,18 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
     """
     job = sync_jobs[job_id]
 
-    if not os.path.isdir(folder_path):
+    folder_there, video_count, files = await in_media_pool(_sync_candidates, folder_path, target_lang)
+    if not folder_there:
         job["status"]      = "error"
         job["message"]     = f"Folder not found: {folder_path}"
         job["finished_at"] = time.time()
         return
 
-    video_files = sorted(
-        f for f in os.listdir(folder_path) if f.lower().endswith((".mkv", ".mp4"))
-    )
-    if not video_files:
+    if not video_count:
         job["status"]      = "error"
         job["message"]     = "No video files (.mkv/.mp4) found in folder"
         job["finished_at"] = time.time()
         return
-
-    # Build work list — only files that have a matching <target_lang>.srt
-    files = []
-    for video_file in video_files:
-        target_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file), target_lang)
-        if os.path.exists(target_srt):
-            files.append({"name": video_file, "status": "pending"})
-        else:
-            logger.warning(f"SYNC: No {target_lang}.srt for {video_file}, skipping")
 
     if not files:
         job["status"]      = "error"
@@ -207,7 +197,7 @@ async def run_ffsubsync_with_progress(job_id: str, folder_path: str, priority: s
         target_srt = sidecar_subtitle_path(video_path, target_lang)
         en_srt     = sidecar_subtitle_path(video_path, SOURCE_LANG)
 
-        cmd, file_entry["method"] = ffsubsync_command(video_path, target_srt, priority)
+        cmd, file_entry["method"] = await in_media_pool(ffsubsync_command, video_path, target_srt, priority)
         logger.info(f"SYNC: {file_entry['method']}-ref mode for {video_file}")
 
         try:
@@ -364,12 +354,31 @@ def get_smart_chunks(subs):
 
 # ================= MKV SUBTITLE EXTRACTION =================
 
+def _sync_candidates(folder_path: str, target_lang: str) -> tuple[bool, int, list[dict]]:
+    """What /sync could align in folder_path: whether the folder is there, how
+    many video files it holds, and the work list of those that already have a
+    <target_lang>.srt next to them.
+
+    One listing of the media folder, read in the media pool."""
+    if not os.path.isdir(folder_path):
+        return False, 0, []
+    video_files = sorted(f for f in os.listdir(folder_path) if f.lower().endswith((".mkv", ".mp4")))
+    files = []
+    for video_file in video_files:
+        target_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file), target_lang)
+        if os.path.exists(target_srt):
+            files.append({"name": video_file, "status": "pending"})
+        else:
+            logger.warning(f"SYNC: No {target_lang}.srt for {video_file}, skipping")
+    return True, len(video_files), files
+
+
 async def extract_english_sub_from_mkv(mkv_path: str) -> str | None:
     """
     Extract English subtitle from a specific MKV file.
     Returns the path to the extracted .en.srt file, or None if failed.
     """
-    if not os.path.exists(mkv_path):
+    if not await in_media_pool(os.path.exists, mkv_path):
         logger.error(f"MKV file not found: {mkv_path}")
         return None
 
@@ -414,7 +423,7 @@ async def extract_english_sub_from_mkv(mkv_path: str) -> str | None:
             subprocess.run, extract_cmd, capture_output=True, text=True
         )
 
-        if result.returncode == 0 and os.path.exists(out_srt):
+        if result.returncode == 0 and await in_media_pool(os.path.exists, out_srt):
             logger.info(f"EXTRACT: Extracted -> {os.path.basename(out_srt)}")
             return out_srt
         else:
@@ -431,19 +440,37 @@ async def find_or_extract_english_sub(folder: str) -> str | None:
     Returns the path to the .en.srt file, or None if not possible.
     """
     # 1. Check for existing .en.srt
-    for f in os.listdir(folder):
-        if is_source_subtitle(f):
-            logger.info(f"EXTRACT: Found existing English sub: {f}")
-            return os.path.join(folder, f)
+    en_files, mkv_files = await in_media_pool(_english_and_video_files, folder)
+    if en_files:
+        logger.info(f"EXTRACT: Found existing English sub: {en_files[0]}")
+        return os.path.join(folder, en_files[0])
 
     # 2. Look for first MKV/MP4 file and extract
-    mkv_files = [f for f in os.listdir(folder) if f.lower().endswith((".mkv", ".mp4"))]
     if not mkv_files:
         logger.info(f"EXTRACT: No .en.srt and no MKV/MP4 found in {folder}")
         return None
 
     mkv_path = os.path.join(folder, mkv_files[0])
     return await extract_english_sub_from_mkv(mkv_path)
+
+
+def _english_and_video_files(folder: str) -> tuple[list[str], list[str]]:
+    """The .en.srt names and the video names in folder, from one media-folder
+    listing read in the media pool."""
+    names = os.listdir(folder)
+    return ([f for f in names if is_source_subtitle(f)],
+            [f for f in names if f.lower().endswith((".mkv", ".mp4"))])
+
+
+def _match_owner_and_mode(path: str, source: str) -> None:
+    """Give a saved subtitle the mode and owner of the English one it came from.
+
+    Media-folder calls, so they wait in the media pool like the save before them."""
+    os.chmod(path, 0o644)
+    source_stat = os.stat(source)
+    os.chown(path, source_stat.st_uid, source_stat.st_gid)
+
+
 def get_progress_bar(current, total, length=20):
     percent = current / total
     filled_length = int(length * percent)
@@ -555,7 +582,7 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
     logger.info(f"START: Processing {en_sub_path}")
 
     try:
-        subs = await asyncio.to_thread(pysubs2.load, en_sub_path)
+        subs = await in_media_pool(pysubs2.load, en_sub_path)
     except Exception as e:
         logger.error(f"Failed to load subtitle {en_sub_path}: {e}")
         outcome.reason = f"Could not read the English subtitle {os.path.basename(en_sub_path)}"
@@ -642,12 +669,10 @@ async def translate_single_subtitle(en_sub_path: str, translator: Translator | N
 
     # Save
     new_path = output_subtitle_path(en_sub_path, target_lang)
-    await asyncio.to_thread(subs.save, new_path, encoding="utf-8")
+    await in_media_pool(subs.save, new_path, encoding="utf-8")
 
     try:
-        os.chmod(new_path, 0o644)
-        source_stat = os.stat(en_sub_path)
-        os.chown(new_path, source_stat.st_uid, source_stat.st_gid)
+        await in_media_pool(_match_owner_and_mode, new_path, en_sub_path)
     except:
         pass
 
@@ -661,19 +686,18 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
     - If input_path is a file: translate its subtitle
     - If input_path is a folder: find all .en.srt, MKV, and MP4 files and translate their subtitles
     """
-    if not os.path.exists(input_path):
+    if not await in_media_pool(os.path.exists, input_path):
         logger.error(f"Path not found: {input_path}")
         mark_done_in_queue(input_path, target_lang)
         return
 
     # Check if input is a folder (series) or file
-    if os.path.isdir(input_path):
+    if await in_media_pool(os.path.isdir, input_path):
         logger.info(f"SERIES: Processing folder {input_path}")
         movie_dir = input_path
 
         # Find all .en.srt, MKV, and MP4 files in the folder
-        srt_files   = [f for f in os.listdir(movie_dir) if is_source_subtitle(f)]
-        video_files = [f for f in os.listdir(movie_dir) if f.lower().endswith((".mkv", ".mp4"))]
+        srt_files, video_files = await in_media_pool(_english_and_video_files, movie_dir)
         if not srt_files and not video_files:
             logger.warning(f"SKIP: No .en.srt or MKV/MP4 files found in {movie_dir}")
             mark_done_in_queue(input_path, target_lang)
@@ -687,7 +711,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
             base     = strip_source_suffix(srt_file)
             srt_path = os.path.join(movie_dir, srt_file)
             out_path = output_subtitle_path(srt_path, target_lang)
-            if os.path.exists(out_path):
+            if await in_media_pool(os.path.exists, out_path):
                 logger.info(f"EPISODE: Skipping {srt_file}, {os.path.basename(out_path)} already exists.")
                 processed_bases.add(base.lower())
                 continue
@@ -701,7 +725,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
         for video_file in sorted(video_files):
             base    = os.path.splitext(video_file)[0]
             out_path = sidecar_subtitle_path(os.path.join(movie_dir, video_file), target_lang)
-            if os.path.exists(out_path):
+            if await in_media_pool(os.path.exists, out_path):
                 logger.info(f"EPISODE: Skipping {video_file}, {os.path.basename(out_path)} already exists.")
                 continue
             if base.lower() in processed_bases:
@@ -736,7 +760,7 @@ async def process_movie(input_path: str, translator: Translator | None = None, t
 
         # Skip if the translation already exists for this specific file.
         out_path = output_subtitle_path(en_sub_path, target_lang)
-        if os.path.exists(out_path):
+        if await in_media_pool(os.path.exists, out_path):
             logger.info(f"SKIP: {out_path} already exists.")
             mark_done_in_queue(input_path, target_lang)
             return
@@ -789,37 +813,48 @@ async def trigger_translation(req: SubtitleRequest, background_tasks: Background
     background_tasks.add_task(process_movie, req.path, target_lang=req.target_lang)
     return {"status": "processing_async", "message": "Translation started in background"}
 
-@app.post("/shift")
-async def shift_subtitle(req: ShiftRequest):
-    if not os.path.exists(req.path):
-        return {"status": "error", "message": "Path not found"}
+def _shift_targets(path: str, target_lang: str) -> list[str] | None:
+    """The files /shift would change: path itself when it is a file, otherwise
+    the <target_lang>.srt files inside it. None when path is not there."""
+    if not os.path.exists(path):
+        return None
+    if os.path.isfile(path):
+        return [path]
+    suffix = subtitle_suffix(target_lang).lower()
+    return [
+        os.path.join(path, f)
+        for f in os.listdir(path)
+        if f.lower().endswith(suffix)
+    ]
 
-    # If it's a file, shift just that file
-    if os.path.isfile(req.path):
-        targets = [req.path]
-    # If it's a folder, shift all <target_lang>.srt inside
-    else:
-        suffix = subtitle_suffix(req.target_lang).lower()
-        targets = [
-            os.path.join(req.path, f)
-            for f in os.listdir(req.path)
-            if f.lower().endswith(suffix)
-        ]
 
-    if not targets:
-        return {"status": "error", "message": f"No {req.target_lang}.srt files found"}
+def _shift_subtitle_files(targets: list[str], offset_ms: int) -> tuple[list[str], list[dict]]:
+    """Shift every file in place: the paths that changed, and the ones that failed.
 
+    Runs in the media pool, so reading and writing the subtitles wait there
+    instead of on the event loop."""
     shifted = []
     failed = []
     for srt_path in targets:
         try:
             subs = pysubs2.load(srt_path)
-            subs.shift(ms=req.offset_ms)
+            subs.shift(ms=offset_ms)
             subs.save(srt_path, encoding="utf-8")
             shifted.append(srt_path)
         except Exception as e:
             failed.append({"path": srt_path, "error": str(e)})
+    return shifted, failed
 
+
+@app.post("/shift")
+async def shift_subtitle(req: ShiftRequest):
+    targets = await check_media_folder(req.path, _shift_targets, req.path, req.target_lang)
+    if targets is None:
+        return {"status": "error", "message": "Path not found"}
+    if not targets:
+        return {"status": "error", "message": f"No {req.target_lang}.srt files found"}
+
+    shifted, failed = await check_media_folder(req.path, _shift_subtitle_files, targets, req.offset_ms)
     if shifted:
         log_history(req.path, "shift")
     return {
@@ -836,7 +871,7 @@ async def sync_folder(req: SyncRequest, background_tasks: BackgroundTasks):
     Start an async sync job. Returns a job_id immediately; poll
     GET /sync/progress/{job_id} (SSE) for live per-file progress.
     """
-    if not os.path.exists(req.path):
+    if not await check_media_folder(req.path, os.path.exists, req.path):
         return {"status": "error", "message": "Path not found"}
 
     _prune_sync_jobs()
@@ -891,16 +926,52 @@ job_wakeup = asyncio.Event()
 LOOKUP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lookup")
 MODELS_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="models")
 POSTER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poster")
+# The media folder is a hard NFS mount in production: a file check on it can
+# wait forever, it never fails by itself, and the thread waiting there cannot
+# be cancelled. It gets its own pool, so a stuck folder cannot take the lookup,
+# model and poster pools with it. A request that must answer waits only
+# MEDIA_FOLDER_TIMEOUT_SECONDS for it (set it in .env, see .env.example);
+# a job may wait longer, in a thread the event loop does not depend on.
+MEDIA_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="media")
+MEDIA_FOLDER_TIMEOUT_SECONDS = float(os.getenv("MEDIA_FOLDER_TIMEOUT_SECONDS", "20"))
 GEMINI_RETRY_SECONDS = 600
 _gemini_blocked_until = 0.0
 
 
-async def run_in(pool, fn, *args):
-    return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
+async def run_in(pool, fn, *args, **kwargs):
+    return await asyncio.get_running_loop().run_in_executor(pool, functools.partial(fn, *args, **kwargs))
 
 
 async def in_lookup_pool(fn, *args):
     return await run_in(LOOKUP_POOL, fn, *args)
+
+
+async def in_media_pool(fn, *args, **kwargs):
+    """Media-folder work a job may wait for as long as the folder takes.
+
+    It runs in a thread, so a folder that answers slowly never holds the event
+    loop the requests are served on."""
+    return await run_in(MEDIA_POOL, fn, *args, **kwargs)
+
+
+async def check_media_folder(folder: str, fn, *args, **kwargs):
+    """Media-folder work for a request that must answer, with a deadline.
+
+    Past the deadline the request answers 503 naming the media folder, and the
+    warning says which folder gave no answer. The worker still waiting on the
+    mount cannot be cancelled: it stays in the media pool."""
+    try:
+        return await asyncio.wait_for(run_in(MEDIA_POOL, fn, *args, **kwargs),
+                                      MEDIA_FOLDER_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(f"MEDIA FOLDER {folder}: no answer within {MEDIA_FOLDER_TIMEOUT_SECONDS} s")
+        raise HTTPException(503, f"The media folder is not answering ({folder})")
+
+
+def media_folder_of(server) -> str:
+    """The folder a server's files map to, as this backend sees them: the name a
+    media-folder timeout reports."""
+    return ", ".join(sorted({local for _server_path, local in server.path_map.rules}))
 
 
 async def run_translate_job(job, report) -> tuple[str, str]:
@@ -908,13 +979,13 @@ async def run_translate_job(job, report) -> tuple[str, str]:
     video, lang = job["video_path"], job["target_lang"]
     if lang == SOURCE_LANG:
         return "failed", "English is the source language; pick another target"
-    if not os.path.exists(video):
+    if not await in_media_pool(os.path.exists, video):
         return "failed", "Video file not found"
     out_path = sidecar_subtitle_path(video, lang)
-    if os.path.exists(out_path) and not job["overwrite"]:
+    if await in_media_pool(os.path.exists, out_path) and not job["overwrite"]:
         return "skipped", f"{os.path.basename(out_path)} already exists"
     source = sidecar_subtitle_path(video, SOURCE_LANG)
-    if not os.path.exists(source):
+    if not await in_media_pool(os.path.exists, source):
         source = await extract_english_sub_from_mkv(video)
         if source is None:
             return "failed", "No English subtitle (no .en.srt and none in the video)"
@@ -942,21 +1013,22 @@ async def run_translate_job(job, report) -> tuple[str, str]:
 
 async def run_shift_job(job, report) -> tuple[str, str]:
     target = sidecar_subtitle_path(job["video_path"], job["target_lang"])
-    if not os.path.exists(target):
+    if not await in_media_pool(os.path.exists, target):
         return "skipped", f"No {os.path.basename(target)} to shift"
     offset = int(job["params"].get("offset_ms", 0))
-    subs = await asyncio.to_thread(pysubs2.load, target)
-    subs.shift(ms=offset)
-    await asyncio.to_thread(subs.save, target, encoding="utf-8")
+    shifted, failed = await in_media_pool(_shift_subtitle_files, [target], offset)
+    if not shifted:
+        return "failed", (failed[0]["error"] if failed else f"Could not save {os.path.basename(target)}")
     return "done", f"Shifted {offset:+d} ms"
 
 
 async def run_sync_job(job, report) -> tuple[str, str]:
     video = job["video_path"]
     target = sidecar_subtitle_path(video, job["target_lang"])
-    if not os.path.exists(target):
+    if not await in_media_pool(os.path.exists, target):
         return "skipped", f"No {os.path.basename(target)} to sync"
-    cmd, method = ffsubsync_command(video, target, job["params"].get("priority", "auto"))
+    cmd, method = await in_media_pool(ffsubsync_command, video, target,
+                                      job["params"].get("priority", "auto"))
     result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=1800)
     if result.returncode != 0:
         return "failed", f"ffsubsync ({method}) failed: {(result.stderr or 'unknown error')[-300:]}"
@@ -1052,6 +1124,27 @@ def _subtitle_status(item, lang, active) -> str:
     return "done" if os.path.exists(sidecar_subtitle_path(path, lang)) else "missing"
 
 
+def _badge_statuses(items, lang, active) -> list[str]:
+    """The badge of every item, in one batch of media-folder checks.
+
+    Called in the media pool, so one library page needs one batch of checks and
+    no title card or episode card looks the files up again. active is read here
+    (the job queue's running targets), never written."""
+    return [_subtitle_status(item, lang, active) for item in items]
+
+
+def _badge_order(titles, episodes_by_show) -> list:
+    """The items a library page needs badges for, in listing order: each movie,
+    then the episodes of each show. The batch answers in the same order."""
+    order = []
+    for title in titles:
+        if title.kind == "movie":
+            order.append(title)
+        else:
+            order.extend(episodes_by_show.get(title.id, []))
+    return order
+
+
 @app.get("/config")
 def config_endpoint():
     return {
@@ -1077,19 +1170,22 @@ async def models_endpoint():
 
 @app.get("/library/{server_name}")
 async def library_endpoint(server_name: str, lang: LangCode = DEFAULT_TARGET_LANG, refresh: bool = False):
+    server = _server(server_name)
     titles, episodes_by_show = await _library(server_name, refresh)
     active = jobs.active_targets(DB_FILE)
+    badges = iter(await check_media_folder(media_folder_of(server), _badge_statuses,
+                                          _badge_order(titles, episodes_by_show), lang, active))
     result = []
     for title in titles:
         entry = {"id": title.id, "kind": title.kind, "name": title.name, "year": title.year,
                  "poster": f"/poster/{server_name}/{title.id}"}
         if title.kind == "movie":
-            entry["status"] = _subtitle_status(title, lang, active)
+            entry["status"] = next(badges)
             if entry["status"] == "unmapped":
                 entry["server_path"] = title.server_path
         else:
             episodes = episodes_by_show.get(title.id, [])
-            statuses = [_subtitle_status(e, lang, active) for e in episodes]
+            statuses = [next(badges) for _ in episodes]
             available = [s for s in statuses if s not in ("unavailable", "unmapped")]
             done = statuses.count("done")
             entry.update(done=done, total=len(available))
@@ -1116,11 +1212,13 @@ async def show_endpoint(server_name: str, show_id: str, lang: LangCode = DEFAULT
     except MediaServerError as e:
         raise HTTPException(502, str(e))
     active = jobs.active_targets(DB_FILE)
+    statuses = await check_media_folder(media_folder_of(server), _badge_statuses,
+                                        episodes, lang, active)
     seasons: dict[int, list] = {}
-    for e in episodes:
+    for e, status in zip(episodes, statuses):
         seasons.setdefault(e.season, []).append({
             "id": e.id, "number": e.number, "name": e.name,
-            "status": _subtitle_status(e, lang, active),
+            "status": status,
             **({"server_path": e.server_path} if e.unmapped else {}),
         })
     return {"seasons": [{"season": n, "episodes": eps} for n, eps in sorted(seasons.items())]}
