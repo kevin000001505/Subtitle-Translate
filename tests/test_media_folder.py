@@ -13,14 +13,6 @@ import main
 from conftest import (SAMPLE_SRT, REQUEST_DEADLINE_SECONDS, SCENARIO_DEADLINE_SECONDS, asgi_client,
                       media_folder_is_stuck, request_within, run_scenario)
 
-# How long a request may wait for the media folder in these tests. Production
-# waits longer; the tests only need the wait to be bounded.
-MEDIA_TIMEOUT = 1.0
-
-
-def shorten_media_wait(monkeypatch):
-    monkeypatch.setattr(main, "MEDIA_FOLDER_TIMEOUT_SECONDS", MEDIA_TIMEOUT)
-
 
 def test_the_api_answers_while_the_library_waits_for_the_media_folder(media_stall):
     """Stories 5-8: the page header and languages (/config), the job list, the
@@ -46,19 +38,18 @@ def test_the_api_answers_while_the_library_waits_for_the_media_folder(media_stal
 
 
 def test_a_library_page_that_waits_too_long_answers_503_with_the_media_folder(media_stall, caplog,
-                                                                              monkeypatch):
+                                                                              short_media_wait):
     """Story 9: a library page and a show page give up after the media-folder
     timeout, answer 503 naming the media folder, and log a warning. A thread
     waiting on a hard mount cannot be cancelled, so the request answers and the
     worker stays waiting."""
-    shorten_media_wait(monkeypatch)
     media_stall.stall()
 
     async def scenario():
         async with asgi_client() as client:
             for path in ("/library/jellyfin", "/library/jellyfin/shows/s1"):
                 response = await request_within(client, "GET", path,
-                                                timeout=MEDIA_TIMEOUT + REQUEST_DEADLINE_SECONDS)
+                                                timeout=short_media_wait + REQUEST_DEADLINE_SECONDS)
                 assert response.status_code == 503, path
                 assert str(media_stall.root) in response.json()["detail"], response.json()
 
@@ -69,16 +60,15 @@ def test_a_library_page_that_waits_too_long_answers_503_with_the_media_folder(me
 
 
 def test_the_library_answers_normally_after_the_media_folder_starts_again(media_stall, library,
-                                                                         monkeypatch):
+                                                                         short_media_wait):
     """Story 10: the request that gave up does not poison the backend. Once the
     media folder answers, the next library page is a normal 200 with its badges."""
-    shorten_media_wait(monkeypatch)
     media_stall.stall()
 
     async def scenario():
         async with asgi_client() as client:
             stalled = await request_within(client, "GET", "/library/jellyfin",
-                                           timeout=MEDIA_TIMEOUT + REQUEST_DEADLINE_SECONDS)
+                                           timeout=short_media_wait + REQUEST_DEADLINE_SECONDS)
             assert stalled.status_code == 503
 
             media_stall.release()
@@ -193,10 +183,9 @@ def test_legacy_background_work_keeps_media_folder_reads_off_the_event_loop(medi
 
 def test_a_legacy_request_that_waits_too_long_answers_503_with_the_media_folder(media_stall,
                                                                                library,
-                                                                               monkeypatch):
+                                                                               short_media_wait):
     """/shift and /sync look at the media folder too. They give up after the same
     timeout and answer 503, instead of holding the event loop."""
-    shorten_media_wait(monkeypatch)
     media_stall.stall()
 
     async def scenario():
@@ -208,7 +197,7 @@ def test_a_legacy_request_that_waits_too_long_answers_503_with_the_media_folder(
                 for probe in ("/config", "/jobs"):
                     response = await request_within(client, "GET", probe)
                     assert response.status_code == 200, probe
-                response = await asyncio.wait_for(request, MEDIA_TIMEOUT + REQUEST_DEADLINE_SECONDS)
+                response = await asyncio.wait_for(request, short_media_wait + REQUEST_DEADLINE_SECONDS)
                 assert response.status_code == 503, path
                 assert str(media_stall.root) in response.json()["detail"], response.json()
 

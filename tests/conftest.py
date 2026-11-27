@@ -302,6 +302,19 @@ def library(tmp_path, monkeypatch, llama):
 
 REQUEST_DEADLINE_SECONDS = 3.0      # a test waits this long for one request
 SCENARIO_DEADLINE_SECONDS = 12.0    # ... and this long for a whole scenario
+MEDIA_WAIT_SECONDS = 1.0            # ... and this long for the media folder
+
+
+@pytest.fixture
+def short_media_wait(monkeypatch):
+    """Make requests give up on the media folder after MEDIA_WAIT_SECONDS.
+
+    Production waits longer (MEDIA_FOLDER_TIMEOUT_SECONDS, default 20 s); a test
+    only needs the wait to be bounded. Returns the value, so a test can add it
+    to its own deadline for the request that is waiting.
+    """
+    monkeypatch.setattr(main, "MEDIA_FOLDER_TIMEOUT_SECONDS", MEDIA_WAIT_SECONDS)
+    return MEDIA_WAIT_SECONDS
 
 
 class StalledMediaFolder:
