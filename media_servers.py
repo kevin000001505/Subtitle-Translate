@@ -108,17 +108,17 @@ JELLYFIN_LIBRARY_TYPES = {"movies": "movie", "tvshows": "show"}
 # other types as well: with "group movies into collections" on, the Movies
 # library also returns BoxSet items, even though the request asks for
 # IncludeItemTypes=Movie. The item's own Type decides what becomes a title.
-JELLYFIN_TITLE_TYPES = {"movie": "Movie"}
+JELLYFIN_TITLE_TYPES = {"movie": "Movie", "show": "Series"}
 
 
-def _type_matches(item, expected: str | None) -> bool:
+def _type_matches(item, expected: str) -> bool:
     """Whether Jellyfin says this item is the type being read.
 
     An item whose Type is absent is kept: /Items always reports Type in real
     Jellyfin, and a lookup that asks for no type leaves the field out.
     """
     actual = item.get("Type")
-    return expected is None or not actual or actual == expected
+    return not actual or actual == expected
 
 
 
@@ -169,6 +169,12 @@ class Jellyfin(_Server):
         return by_kind
 
     def titles(self) -> list[Title]:
+        """The movies and shows this backend can translate.
+
+        An item becomes a title only when Jellyfin reports it as the type that
+        library kind holds (JELLYFIN_TITLE_TYPES), because Jellyfin also
+        answers a library with its collection items.
+        """
         titles: dict[str, Title] = {}   # by item id: two libraries can hold the same file
         for kind, library_ids in self._libraries_by_kind().items():
             for library_id in library_ids:
@@ -181,7 +187,7 @@ class Jellyfin(_Server):
                     "SortOrder": "Ascending",
                 })
                 for item in data.get("Items", []):
-                    if not _type_matches(item, JELLYFIN_TITLE_TYPES.get(kind)):
+                    if not _type_matches(item, JELLYFIN_TITLE_TYPES[kind]):
                         continue
                     server_path = item.get("Path") if kind == "movie" else None
                     titles.setdefault(item["Id"], Title(

@@ -51,6 +51,19 @@ def test_jellyfin_lists_only_titles_from_movies_and_tvshows_libraries():
     ]
 
 
+def test_jellyfin_leaves_out_library_items_that_are_not_movies_or_shows():
+    """The shared fixture puts a movie collection in the Movies library and a
+    show collection in the Shows library, the way Jellyfin does when its
+    grouping settings are on. An item becomes a title only when its own Type
+    matches the kind being read."""
+    collections_in_a_title_library = [(item["Id"], item["ParentId"])
+                                      for item in JELLYFIN_ITEMS["Items"]
+                                      if item["Type"] == "BoxSet" and item["ParentId"] in ("lib-movies", "lib-shows")]
+
+    assert collections_in_a_title_library == [("bx1", "lib-movies"), ("bx2", "lib-shows")]
+    assert [t.id for t in jellyfin().titles()] == ["m1", "m2", "s1"]
+
+
 def test_jellyfin_sends_its_api_key_in_the_authorization_header():
     http = FakeJellyfinHttp(jellyfin_routes())
     jellyfin(http).titles()

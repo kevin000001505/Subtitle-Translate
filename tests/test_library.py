@@ -70,16 +70,18 @@ def test_the_path_map_warning_counts_only_files_in_movies_and_shows_libraries(li
     assert "/data/JellyBridge/Discover" not in caplog.text
 
 
-def test_a_collection_inside_the_movies_library_is_not_listed_as_a_movie(library, caplog):
+def test_a_collection_inside_a_title_library_is_not_listed_as_a_title(library, caplog):
     """With "group movies into collections" on, Jellyfin answers the Movies
     library with BoxSet items even though the request asks for
-    IncludeItemTypes=Movie. A collection is not a title: it has no subtitle to
-    translate, and its path is a folder in Jellyfin's config, so listing it
-    would add a false "unmapped" card and a false file in the path-map warning."""
+    IncludeItemTypes=Movie, and the Shows library the same way. A collection is
+    not a title: it has no subtitle to translate, and its path is a folder in
+    Jellyfin's config, so listing it would add a false "unmapped" card and a
+    false file in the path-map warning."""
     titles = library.client.get("/library/jellyfin").json()["titles"]
 
-    assert [t["name"] for t in titles] == ["Arrival", "Elsewhere", "Severance"]
-    assert "Along with the Gods Collection" not in caplog.text
+    assert [(t["id"], t["name"]) for t in titles] == [
+        ("m1", "Arrival"), ("m2", "Elsewhere"), ("s1", "Severance")]
+    assert "Collection" not in caplog.text
     assert "1 file(s) are outside JELLYFIN_PATH_MAP" in caplog.text
 
 
