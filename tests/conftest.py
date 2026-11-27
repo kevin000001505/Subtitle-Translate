@@ -227,14 +227,16 @@ class FakeJellyfinHttp(FakeHttp):
     """/Library/VirtualFolders answers with the configured libraries.
     /Items answers with titles or with all episodes depending on IncludeItemTypes,
     and only with the items of the library (ParentId) the request asked about.
-    Set episode_items to change the episode listing."""
+    Set title_items or episode_items to change those listings."""
 
+    title_items = None
     episode_items = None
 
     def request(self, method, url, params=None, headers=None, timeout=None):
         if url.endswith("/Items") and params:
             episodes = self.episode_items or JELLYFIN_EPISODES
-            body = episodes if params.get("IncludeItemTypes") == "Episode" else JELLYFIN_ITEMS
+            titles = self.title_items or JELLYFIN_ITEMS
+            body = episodes if params.get("IncludeItemTypes") == "Episode" else titles
             parent = params.get("ParentId")
             items = [item for item in body["Items"] if not parent or item.get("ParentId") == parent]
             self.routes[("GET", "/Items")] = {"Items": items, "TotalRecordCount": len(items)}

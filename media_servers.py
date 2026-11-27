@@ -101,10 +101,7 @@ def _by_episode(episodes):
 
 
 # Jellyfin library types whose items can be translated, mapped to the title
-# kind they hold. Every other type is skipped, the way Plex's library
-# sections are: a boxsets library holds groups of titles, not files, and a
-# library with no type at all (a mixed one, or the JellyBridge Discover
-# library of placeholder files) holds nothing to open.
+# kind each one holds. _libraries_by_kind says why every other type is skipped.
 JELLYFIN_LIBRARY_TYPES = {"movies": "movie", "tvshows": "show"}
 
 
@@ -143,6 +140,9 @@ class Jellyfin(_Server):
         Discover placeholder library, a library with no type) is skipped, the
         same rule Plex applies to its library sections. Fetched once per call,
         never per item.
+
+        /Library/VirtualFolders needs elevation, and Jellyfin gives every API
+        key the Administrator role, so the key in JELLYFIN_API_KEY can read it.
         """
         by_kind: dict[str, list[str]] = {}
         for folder in self._call("GET", "/Library/VirtualFolders"):
@@ -152,7 +152,7 @@ class Jellyfin(_Server):
         return by_kind
 
     def titles(self) -> list[Title]:
-        titles = []
+        titles: dict[str, Title] = {}   # by item id: two libraries can hold the same file
         for kind, library_ids in self._libraries_by_kind().items():
             for library_id in library_ids:
                 data = self._call("GET", "/Items", params={
@@ -165,15 +165,16 @@ class Jellyfin(_Server):
                 })
                 for item in data.get("Items", []):
                     server_path = item.get("Path") if kind == "movie" else None
-                    titles.append(Title(
+                    titles.setdefault(item["Id"], Title(
                         id=item["Id"], kind=kind, name=item.get("Name", ""),
                         year=item.get("ProductionYear"),
                         path=self.path_map.to_local(server_path), server_path=server_path,
                     ))
-        return sorted(titles, key=lambda t: t.name.lower())
+        return sorted(titles.values(), key=lambda t: t.name.lower())
 
     def episodes_by_show(self) -> dict[str, list[Episode]]:
         by_show: dict[str, list[Episode]] = {}
+        seen: set[str] = set()   # two libraries can hold the same file: count it once
         for library_id in self._libraries_by_kind().get("show", []):
             data = self._call("GET", "/Items", params={
                 "ParentId": library_id,
@@ -182,6 +183,9 @@ class Jellyfin(_Server):
                 "Fields": "Path",
             })
             for item in data.get("Items", []):
+                if item["Id"] in seen:
+                    continue
+                seen.add(item["Id"])
                 by_show.setdefault(item.get("SeriesId", ""), []).append(self._episode(item))
         return {show: _by_episode(episodes) for show, episodes in by_show.items()}
 
