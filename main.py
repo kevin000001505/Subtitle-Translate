@@ -932,7 +932,11 @@ POSTER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poster")
 # model and poster pools with it. A request that must answer waits only
 # MEDIA_FOLDER_TIMEOUT_SECONDS for it (set it in .env, see .env.example);
 # a job may wait longer, in a thread the event loop does not depend on.
-MEDIA_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="media")
+# A check that waits holds one media worker until the folder answers, so at most
+# MEDIA_POOL_WORKERS of them wait at once; the lookup, model and poster pools,
+# and the event loop, stay free whatever the media folder does.
+MEDIA_POOL_WORKERS = 8
+MEDIA_POOL = ThreadPoolExecutor(max_workers=MEDIA_POOL_WORKERS, thread_name_prefix="media")
 MEDIA_FOLDER_TIMEOUT_SECONDS = float(os.getenv("MEDIA_FOLDER_TIMEOUT_SECONDS", "20"))
 GEMINI_RETRY_SECONDS = 600
 _gemini_blocked_until = 0.0

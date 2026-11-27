@@ -29,7 +29,7 @@ The folder the backend opens media files from: `/media` in the container, the lo
 _Avoid_: media drive, media share
 
 **Media pool**:
-The threads the backend uses to open media-folder files, separate from the lookup, model and poster pools. Only these threads can be held by a stalled **media folder**. A request that must answer waits at most `MEDIA_FOLDER_TIMEOUT_SECONDS` for them and then answers 503 naming the media folder; a job may wait longer, in a thread no request depends on.
+The threads the backend uses to open media-folder files, separate from the lookup, model and poster pools. Only these threads can be held by a stalled **media folder**: one check holds one of the pool's `MEDIA_POOL_WORKERS` threads until the folder answers, and the lookup, model and poster pools and the event loop stay free. A request that must answer waits at most `MEDIA_FOLDER_TIMEOUT_SECONDS` for them and then answers 503 naming the media folder; a job may wait longer, in a thread no request depends on.
 _Avoid_: media thread, worker pool
 
 **Media library**:
