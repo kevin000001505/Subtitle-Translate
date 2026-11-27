@@ -1,6 +1,7 @@
 import pytest
 
-from conftest import FakeHttp, FakeJellyfinHttp, jellyfin_routes
+from conftest import (FakeHttp, FakeJellyfinHttp, JELLYFIN_EPISODES, JELLYFIN_ITEMS, JELLYFIN_LIBRARIES,
+                      SEVERANCE_EPISODES, jellyfin_routes)
 from media_servers import Jellyfin, MediaServerError, PathMap, Plex, configured_servers
 
 
@@ -38,6 +39,18 @@ def test_jellyfin_lists_movies_and_shows_with_backend_paths():
     ]
 
 
+def test_jellyfin_lists_only_titles_from_movies_and_tvshows_libraries():
+    """Discover (the JellyBridge placeholder library) and Collections are not
+    Movies or Shows libraries, so their items are not in the library."""
+    titles = jellyfin().titles()
+
+    assert [(t.id, t.kind, t.name) for t in titles] == [
+        ("m1", "movie", "Arrival"),
+        ("m2", "movie", "Elsewhere"),
+        ("s1", "show", "Severance"),
+    ]
+
+
 def test_jellyfin_sends_its_api_key_in_the_authorization_header():
     http = FakeJellyfinHttp(jellyfin_routes())
     jellyfin(http).titles()
@@ -58,6 +71,80 @@ def test_jellyfin_episodes_are_ordered_and_missing_files_have_no_path():
 
 def test_jellyfin_groups_all_episodes_by_show():
     assert [e.id for e in jellyfin().episodes_by_show()["s1"]] == ["e1", "e2", "e3"]
+
+
+def test_jellyfin_episode_lookup_uses_only_tvshows_libraries():
+    by_show = jellyfin().episodes_by_show()
+
+    assert {show: [e.id for e in episodes] for show, episodes in by_show.items()} == {
+        "s1": ["e1", "e2", "e3"],
+    }
+
+
+def test_a_jellyfin_server_without_movies_or_shows_libraries_lists_an_empty_library():
+    other_libraries = [folder for folder in JELLYFIN_LIBRARIES
+                       if folder.get("CollectionType") not in ("movies", "tvshows")]
+    server = jellyfin(FakeJellyfinHttp(jellyfin_routes(libraries=other_libraries)))
+
+    assert server.titles() == []
+    assert server.episodes_by_show() == {}
+
+
+def test_jellyfin_orders_titles_by_name_whatever_order_the_libraries_come_in():
+    shows_first = list(reversed(JELLYFIN_LIBRARIES))
+    titles = jellyfin(FakeJellyfinHttp(jellyfin_routes(libraries=shows_first))).titles()
+
+    assert [t.name for t in titles] == ["Arrival", "Elsewhere", "Severance"]
+
+
+def test_jellyfin_fetches_the_library_list_once_per_lookup():
+    """Once per titles() and once per episodes_by_show(), never once per
+    library or per item."""
+    http = FakeJellyfinHttp(jellyfin_routes())
+    server = jellyfin(http)
+
+    def library_list_calls():
+        return [c for c in http.calls if c["path"] == "/Library/VirtualFolders"]
+
+    server.titles()
+    assert len(library_list_calls()) == 1
+    server.episodes_by_show()
+    assert len(library_list_calls()) == 2
+
+
+def _library_sharing_a_folder(kind: str) -> dict:
+    """A second library of this kind whose folder sits inside the first one's.
+    Jellyfin then answers both libraries' queries with the same items."""
+    library_type, label, folder = (("movies", "Kids Movies", "/data/media/Movies/Kids") if kind == "movie"
+                                   else ("tvshows", "Kids Shows", "/data/media/TV/Kids"))
+    return {"Name": label, "CollectionType": library_type,
+            "ItemId": f"lib-kids-{kind}", "Locations": [folder]}
+
+
+def test_jellyfin_lists_a_title_two_movies_libraries_share_only_once():
+    """Listing the shared file twice would double its badge and the count in
+    the path-map warning."""
+    kids = _library_sharing_a_folder("movie")
+    shared = [dict(item, ParentId=kids["ItemId"]) for item in JELLYFIN_ITEMS["Items"] if item["Id"] == "m1"]
+    http = FakeJellyfinHttp(jellyfin_routes(libraries=JELLYFIN_LIBRARIES + [kids]))
+    http.title_items = {"Items": JELLYFIN_ITEMS["Items"] + shared}
+
+    titles = jellyfin(http).titles()
+
+    assert [t.id for t in titles] == ["m1", "m2", "s1"]
+
+
+def test_jellyfin_counts_an_episode_two_shows_libraries_share_only_once():
+    kids = _library_sharing_a_folder("show")
+    shared = [dict(e, ParentId=kids["ItemId"]) for e in SEVERANCE_EPISODES]
+    http = FakeJellyfinHttp(jellyfin_routes(libraries=JELLYFIN_LIBRARIES + [kids]))
+    http.episode_items = {"Items": JELLYFIN_EPISODES["Items"] + shared}
+
+    by_show = jellyfin(http).episodes_by_show()
+
+    assert {show: [e.id for e in episodes] for show, episodes in by_show.items()} == {
+        "s1": ["e1", "e2", "e3"],
+    }
 
 
 def test_jellyfin_poster_and_refresh():

@@ -100,6 +100,11 @@ def _by_episode(episodes):
     return sorted(episodes, key=lambda e: (e.season, e.number))
 
 
+# Jellyfin library types whose items can be translated, mapped to the title
+# kind each one holds. _libraries_by_kind says why every other type is skipped.
+JELLYFIN_LIBRARY_TYPES = {"movies": "movie", "tvshows": "show"}
+
+
 class Jellyfin(_Server):
     name = "jellyfin"
     label = "Jellyfin"
@@ -127,34 +132,61 @@ class Jellyfin(_Server):
             server_path=server_path,
         )
 
+    def _libraries_by_kind(self) -> dict[str, list[str]]:
+        """The ids of the libraries worth reading, grouped by title kind.
+
+        Jellyfin reports one collection type per library. Only "movies" and
+        "tvshows" are used; everything else (a boxsets library, the JellyBridge
+        Discover placeholder library, a library with no type) is skipped, the
+        same rule Plex applies to its library sections. Fetched once per call,
+        never per item.
+
+        /Library/VirtualFolders needs elevation, and Jellyfin gives every API
+        key the Administrator role, so the key in JELLYFIN_API_KEY can read it.
+        """
+        by_kind: dict[str, list[str]] = {}
+        for folder in self._call("GET", "/Library/VirtualFolders"):
+            kind = JELLYFIN_LIBRARY_TYPES.get((folder.get("CollectionType") or "").lower())
+            if kind and folder.get("ItemId"):
+                by_kind.setdefault(kind, []).append(folder["ItemId"])
+        return by_kind
+
     def titles(self) -> list[Title]:
-        data = self._call("GET", "/Items", params={
-            "Recursive": "true",
-            "IncludeItemTypes": "Movie,Series",
-            "Fields": "Path,ProductionYear",
-            "SortBy": "SortName",
-            "SortOrder": "Ascending",
-        })
-        titles = []
-        for item in data.get("Items", []):
-            kind = "movie" if item.get("Type") == "Movie" else "show"
-            server_path = item.get("Path") if kind == "movie" else None
-            titles.append(Title(
-                id=item["Id"], kind=kind, name=item.get("Name", ""),
-                year=item.get("ProductionYear"),
-                path=self.path_map.to_local(server_path), server_path=server_path,
-            ))
-        return titles
+        titles: dict[str, Title] = {}   # by item id: two libraries can hold the same file
+        for kind, library_ids in self._libraries_by_kind().items():
+            for library_id in library_ids:
+                data = self._call("GET", "/Items", params={
+                    "ParentId": library_id,
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Movie" if kind == "movie" else "Series",
+                    "Fields": "Path,ProductionYear",
+                    "SortBy": "SortName",
+                    "SortOrder": "Ascending",
+                })
+                for item in data.get("Items", []):
+                    server_path = item.get("Path") if kind == "movie" else None
+                    titles.setdefault(item["Id"], Title(
+                        id=item["Id"], kind=kind, name=item.get("Name", ""),
+                        year=item.get("ProductionYear"),
+                        path=self.path_map.to_local(server_path), server_path=server_path,
+                    ))
+        return sorted(titles.values(), key=lambda t: t.name.lower())
 
     def episodes_by_show(self) -> dict[str, list[Episode]]:
-        data = self._call("GET", "/Items", params={
-            "Recursive": "true",
-            "IncludeItemTypes": "Episode",
-            "Fields": "Path",
-        })
         by_show: dict[str, list[Episode]] = {}
-        for item in data.get("Items", []):
-            by_show.setdefault(item.get("SeriesId", ""), []).append(self._episode(item))
+        seen: set[str] = set()   # two libraries can hold the same file: count it once
+        for library_id in self._libraries_by_kind().get("show", []):
+            data = self._call("GET", "/Items", params={
+                "ParentId": library_id,
+                "Recursive": "true",
+                "IncludeItemTypes": "Episode",
+                "Fields": "Path",
+            })
+            for item in data.get("Items", []):
+                if item["Id"] in seen:
+                    continue
+                seen.add(item["Id"])
+                by_show.setdefault(item.get("SeriesId", ""), []).append(self._episode(item))
         return {show: _by_episode(episodes) for show, episodes in by_show.items()}
 
     def episodes(self, show_id: str) -> list[Episode]:

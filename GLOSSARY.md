@@ -23,3 +23,7 @@ _Avoid_: broken mount, wrong path
 **Job queue**:
 The persisted set of translation jobs the backend processes, stored in `queue_data/` on the host.
 _Avoid_: task list, backlog
+
+**Media library**:
+A library that the media server indexes: a Jellyfin virtual folder or a Plex library section. Only a library of type movies or tvshows feeds the library page and the episode lookup. Jellyfin skips every other library: a boxsets library, a library with no type, and a placeholder library such as JellyBridge Discover.
+_Avoid_: collection, shelf
