@@ -100,10 +100,11 @@ def _by_episode(episodes):
     return sorted(episodes, key=lambda e: (e.season, e.number))
 
 
-# Jellyfin library types whose items can be translated. Any other type is
-# skipped, the way Plex's library sections are: boxsets hold no file of their
-# own, and a library with no type at all (a mixed one, or the JellyBridge
-# Discover library of placeholder files) holds nothing to open.
+# Jellyfin library types whose items can be translated, mapped to the title
+# kind they hold. Every other type is skipped, the way Plex's library
+# sections are: a boxsets library holds groups of titles, not files, and a
+# library with no type at all (a mixed one, or the JellyBridge Discover
+# library of placeholder files) holds nothing to open.
 JELLYFIN_LIBRARY_TYPES = {"movies": "movie", "tvshows": "show"}
 
 
@@ -134,14 +135,14 @@ class Jellyfin(_Server):
             server_path=server_path,
         )
 
-    def _libraries(self) -> dict[str, list[str]]:
-        """The ids of the libraries worth reading, keyed by title kind.
+    def _libraries_by_kind(self) -> dict[str, list[str]]:
+        """The ids of the libraries worth reading, grouped by title kind.
 
         Jellyfin reports one collection type per library. Only "movies" and
-        "tvshows" are used; everything else (boxsets, the JellyBridge Discover
-        placeholder library, a library with no type) is skipped, the same rule
-        Plex applies to its library sections. Fetched once per call, never per
-        item.
+        "tvshows" are used; everything else (a boxsets library, the JellyBridge
+        Discover placeholder library, a library with no type) is skipped, the
+        same rule Plex applies to its library sections. Fetched once per call,
+        never per item.
         """
         by_kind: dict[str, list[str]] = {}
         for folder in self._call("GET", "/Library/VirtualFolders"):
@@ -152,7 +153,7 @@ class Jellyfin(_Server):
 
     def titles(self) -> list[Title]:
         titles = []
-        for kind, library_ids in self._libraries().items():
+        for kind, library_ids in self._libraries_by_kind().items():
             for library_id in library_ids:
                 data = self._call("GET", "/Items", params={
                     "ParentId": library_id,
@@ -173,7 +174,7 @@ class Jellyfin(_Server):
 
     def episodes_by_show(self) -> dict[str, list[Episode]]:
         by_show: dict[str, list[Episode]] = {}
-        for library_id in self._libraries().get("show", []):
+        for library_id in self._libraries_by_kind().get("show", []):
             data = self._call("GET", "/Items", params={
                 "ParentId": library_id,
                 "Recursive": "true",

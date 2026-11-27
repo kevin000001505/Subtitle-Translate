@@ -189,8 +189,8 @@ JELLYFIN_ITEMS = {"Items": [
      "ParentId": "lib-shows"},
     {"Id": "d1", "Name": "Dune", "Type": "Movie", "ProductionYear": 2021,
      "Path": "/data/JellyBridge/Discover/Dune (2021)/Dune.mkv", "ParentId": "lib-discover"},
-    {"Id": "c1", "Name": "Blade Runner Collection", "Type": "Movie",
-     "ProductionYear": None, "Path": "/data/media/Movies/Collections/Blade Runner",
+    {"Id": "c1", "Name": "Blade Runner Collection", "Type": "BoxSet",
+     "ProductionYear": None, "Path": "/data/media/Movies/Blade Runner Collection",
      "ParentId": "lib-boxsets"},
 ], "TotalRecordCount": 5}
 

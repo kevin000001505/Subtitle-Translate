@@ -25,5 +25,5 @@ The persisted set of translation jobs the backend processes, stored in `queue_da
 _Avoid_: task list, backlog
 
 **Media library**:
-A library the media server indexes: a Jellyfin virtual folder or a Plex library section. Only libraries of type movies or tvshows feed the library page and the episode lookup. Jellyfin skips every other library: boxsets, a library with no type, and a placeholder library such as JellyBridge Discover.
-_Avoid_: collection, shelf, folder
+A library that the media server indexes: a Jellyfin virtual folder or a Plex library section. Only a library of type movies or tvshows feeds the library page and the episode lookup. Jellyfin skips every other library: a boxsets library, a library with no type, and a placeholder library such as JellyBridge Discover.
+_Avoid_: collection, shelf
