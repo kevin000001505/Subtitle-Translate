@@ -3,7 +3,7 @@
 Production mounts the media folder as a hard NFS mount, so a file check on it
 can wait forever and never fails by itself. A job may wait that long, but only
 that job waits: the job runners make their media-folder checks in the media
-folder's own thread pool, so the API keeps answering, the job list still shows
+folder's own threads, so the backend keeps answering, the job list still shows
 the job as running, and queueing new work (a media-server lookup, no file check)
 still answers. See the stalled media folder harness in conftest.
 """
@@ -69,7 +69,7 @@ def test_a_translate_job_that_waits_for_the_media_folder_holds_only_itself(media
 
 
 def test_a_shift_job_that_waits_for_the_media_folder_holds_only_itself(media_stall, library):
-    """Story 16: a shift job stuck on the media folder leaves the API answering
+    """Story 16: a shift job stuck on the media folder leaves the backend answering
     and stays visible as running. When the folder answers, it shifts the
     subtitle as it always has."""
     (library.movie / "Arrival.zh-TW.srt").write_text(SAMPLE_SRT)
@@ -157,13 +157,14 @@ def test_queueing_a_movie_answers_while_a_job_waits_for_the_media_folder(media_s
         [("ja", "queued"), ("zh-TW", "done")]
 
 
-def test_page_requests_that_gave_up_on_the_media_folder_do_not_take_the_api_down(media_stall, library,
-                                                                                 short_media_wait):
+def test_page_requests_that_gave_up_on_the_media_folder_do_not_take_the_backend_down(media_stall, library,
+                                                                                      short_media_wait):
     """The media pool is shared on purpose: a job waits for the folder, and so do
     the library pages that gave up on it. A thread stuck on a hard mount cannot be
-    cancelled, so a page that answered 503 leaves its worker waiting there, and at
-    most MEDIA_POOL_WORKERS of them can wait at once. That must not take the API
-    down, and the job finishes when the folder answers again, without a restart."""
+    cancelled, so a page that answered 503 leaves its media worker waiting there,
+    and at most MEDIA_POOL_WORKERS of them can wait at once. That must not take the
+    backend down, and the job finishes when the folder answers again, without a
+    restart."""
     media_stall.stall()
 
     async def scenario():

@@ -57,7 +57,7 @@ def test_a_show_page_that_waits_too_long_answers_503_with_the_media_folder(media
     run_scenario(scenario())
 
 
-def test_the_api_answers_while_a_show_page_waits_for_the_media_folder(media_stall, short_media_wait):
+def test_the_backend_answers_while_a_show_page_waits_for_the_media_folder(media_stall, short_media_wait):
     """Story 5-8 and story 17 while a *show* page waits: the page header and
     languages (/config), the job list, the model list, a poster and a new job
     (a media-server lookup with no file check) all answer inside the deadline."""

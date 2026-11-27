@@ -175,7 +175,7 @@ class FakeHttp:
 
 
 # Jellyfin's libraries ("virtual folders") and the items inside them.
-# Jellyfin reports a collection type per library; Discover has none (it is the
+# Jellyfin reports a library type per folder; Discover has none (it is the
 # JellyBridge placeholder library) and Collections is a boxsets library.
 JELLYFIN_LIBRARIES = [
     {"Name": "Movies", "CollectionType": "movies", "ItemId": "lib-movies",
@@ -194,11 +194,10 @@ JELLYFIN_ITEMS = {"Items": [
      "Path": "/data/JellyBridge/Elsewhere.mkv", "ParentId": "lib-movies"},
     {"Id": "s1", "Name": "Severance", "Type": "Series", "ProductionYear": 2022,
      "ParentId": "lib-shows"},
-    # Jellyfin answers a library with its collection items too: with "group
-    # movies into collections" on, the Movies library itself holds BoxSet
-    # items, even though the request asks for IncludeItemTypes=Movie. A
-    # collection's path is a folder in Jellyfin's own config, so no path-map
-    # rule covers it.
+    # Jellyfin answers a library with its box sets too: with "group movies into
+    # collections" on, the Movies library itself holds BoxSet items, even though
+    # the request asks for IncludeItemTypes=Movie. A box set's path is a folder
+    # in Jellyfin's own config, so no path-map rule covers it.
     {"Id": "bx1", "Name": "Along with the Gods Collection", "Type": "BoxSet",
      "ProductionYear": None, "Path": "/data/collections/Along with the Gods Collection",
      "ParentId": "lib-movies"},
@@ -336,8 +335,6 @@ class StalledMediaFolder:
 
     def __init__(self, root):
         self.root = os.path.abspath(str(root))
-        self.checks = 0                 # held file accesses seen (checks and opens)
-        self.check_threads = set()      # names of the threads that made them
         # A stalled mount holds a file check and a file open apart from each
         # other, so a test can stall one kind only and let a flow reach the phase
         # it means to test (a subtitle read, past the folder listing).
@@ -363,11 +360,6 @@ class StalledMediaFolder:
             event.clear()
         self._stuck.clear()
 
-    def reset_checks(self):
-        """Count the file accesses made after this call."""
-        self.checks = 0
-        self.check_threads.clear()
-
     def wait_until_stuck(self, timeout) -> bool:
         """Whether a file access is waiting on the stalled media folder."""
         return self._stuck.wait(timeout)
@@ -377,12 +369,10 @@ class StalledMediaFolder:
         return target == self.root or target.startswith(self.root + os.sep)
 
     def hold(self, path, kind="check"):
-        """Record the file access, then wait here while the media folder is
-        stalled for that kind of access and path is under root."""
+        """Wait here while the media folder is stalled for that kind of access
+        and path is under root."""
         if not self._under_root(path):
             return
-        self.checks += 1
-        self.check_threads.add(threading.current_thread().name)
         stalled = self._stalled[kind]
         if not stalled.is_set():
             return
@@ -493,6 +483,25 @@ async def media_folder_is_stuck(stalled: StalledMediaFolder,
     the failure these tests look for.
     """
     return await asyncio.wait_for(asyncio.to_thread(stalled.wait_until_stuck, timeout), timeout)
+
+
+# The endpoints that answer without opening a media-folder file: they read
+# configuration, the job queue, the model list, or a media-server poster.
+ENDPOINTS_WITHOUT_A_MEDIA_FOLDER_FILE = ("/config", "/jobs", "/models", "/poster/jellyfin/m1")
+
+
+async def backend_answers_while(client, stalled: StalledMediaFolder, waiting,
+                                paths=ENDPOINTS_WITHOUT_A_MEDIA_FOLDER_FILE):
+    """Probe the endpoints that need no media-folder file, while `waiting` is
+    stuck on the stalled media folder.
+
+    `waiting` must still be pending: a request that answered while the folder was
+    stalled answered without the file it came for."""
+    assert await media_folder_is_stuck(stalled), "no media-folder file access happened"
+    assert not waiting.done(), "the waiting request answered while the media folder was stalled"
+    for path in paths:
+        response = await request_within(client, "GET", path)
+        assert response.status_code == 200, path
 
 
 def run_scenario(coro, deadline=SCENARIO_DEADLINE_SECONDS):

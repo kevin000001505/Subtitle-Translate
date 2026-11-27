@@ -26,8 +26,8 @@ from media_servers import MediaServerError, configured_servers
 from translate_gemma import (TRANSLATE_GEMMA_MODEL, TranslateGemmaClient, list_models,
                              models_url as llama_swap_models_url)
 from subtitle_files import (DEFAULT_TARGET_LANG, LANGUAGES, SOURCE_LANG, canonical_lang, is_source_subtitle,
-                            output_subtitle_path, sidecar_subtitle_path, strip_source_suffix,
-                            subtitle_suffix)
+                            is_video_file, output_subtitle_path, sidecar_subtitle_path,
+                            strip_source_suffix, subtitle_suffix)
 
 try:
     from google import genai
@@ -362,9 +362,10 @@ def _sync_candidates(folder_path: str, target_lang: str) -> tuple[bool, int, lis
     One listing of the media folder, read in the media pool."""
     if not os.path.isdir(folder_path):
         return False, 0, []
-    video_files = sorted(f for f in os.listdir(folder_path) if f.lower().endswith((".mkv", ".mp4")))
+    # The same single listing the translate flow uses; /sync needs only the video names.
+    _english_subtitles, video_files = _english_and_video_files(folder_path)
     files = []
-    for video_file in video_files:
+    for video_file in sorted(video_files):
         target_srt = sidecar_subtitle_path(os.path.join(folder_path, video_file), target_lang)
         if os.path.exists(target_srt):
             files.append({"name": video_file, "status": "pending"})
@@ -456,10 +457,11 @@ async def find_or_extract_english_sub(folder: str) -> str | None:
 
 def _english_and_video_files(folder: str) -> tuple[list[str], list[str]]:
     """The .en.srt names and the video names in folder, from one media-folder
-    listing read in the media pool."""
+    listing read in the media pool. The only place this backend lists a media
+    folder."""
     names = os.listdir(folder)
     return ([f for f in names if is_source_subtitle(f)],
-            [f for f in names if f.lower().endswith((".mkv", ".mp4"))])
+            [f for f in names if is_video_file(f)])
 
 
 def _match_owner_and_mode(path: str, source: str) -> None:
@@ -848,13 +850,17 @@ def _shift_subtitle_files(targets: list[str], offset_ms: int) -> tuple[list[str]
 
 @app.post("/shift")
 async def shift_subtitle(req: ShiftRequest):
-    targets = await check_media_folder(req.path, _shift_targets, req.path, req.target_lang)
+    # A legacy request waits as long as the media folder takes, and only it
+    # waits: it keeps its usual answer, and the endpoints a browser needs stay
+    # free. See media_folder_or_503 for the pages that must answer in bounded
+    # time.
+    targets = await in_media_pool(_shift_targets, req.path, req.target_lang)
     if targets is None:
         return {"status": "error", "message": "Path not found"}
     if not targets:
         return {"status": "error", "message": f"No {req.target_lang}.srt files found"}
 
-    shifted, failed = await check_media_folder(req.path, _shift_subtitle_files, targets, req.offset_ms)
+    shifted, failed = await in_media_pool(_shift_subtitle_files, targets, req.offset_ms)
     if shifted:
         log_history(req.path, "shift")
     return {
@@ -871,7 +877,7 @@ async def sync_folder(req: SyncRequest, background_tasks: BackgroundTasks):
     Start an async sync job. Returns a job_id immediately; poll
     GET /sync/progress/{job_id} (SSE) for live per-file progress.
     """
-    if not await check_media_folder(req.path, os.path.exists, req.path):
+    if not await in_media_pool(os.path.exists, req.path):
         return {"status": "error", "message": "Path not found"}
 
     _prune_sync_jobs()
@@ -929,9 +935,10 @@ POSTER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poster")
 # The media folder is a hard NFS mount in production: a file check on it can
 # wait forever, it never fails by itself, and the thread waiting there cannot
 # be cancelled. It gets its own pool, so a stuck folder cannot take the lookup,
-# model and poster pools with it. A request that must answer waits only
-# MEDIA_FOLDER_TIMEOUT_SECONDS for it (set it in .env, see .env.example);
-# a job may wait longer, in a thread the event loop does not depend on.
+# model and poster pools with it. A job or a legacy request waits for the folder
+# as long as it takes, in a thread no other request depends on; the library and
+# show pages wait only MEDIA_FOLDER_TIMEOUT_SECONDS (set it in .env, see
+# .env.example) and then answer 503 naming that folder.
 # A check that waits holds one media worker until the folder answers, so at most
 # MEDIA_POOL_WORKERS of them wait at once; the lookup, model and poster pools,
 # and the event loop, stay free whatever the media folder does.
@@ -951,31 +958,29 @@ async def in_lookup_pool(fn, *args):
 
 
 async def in_media_pool(fn, *args, **kwargs):
-    """Media-folder work a job may wait for as long as the folder takes.
+    """Media-folder work a job or a legacy request waits for as long as the
+    media folder takes.
 
     It runs in a thread, so a folder that answers slowly never holds the event
-    loop the requests are served on."""
+    loop the requests are served on. A page that must answer a browser in a
+    bounded time uses media_folder_or_503 instead."""
     return await run_in(MEDIA_POOL, fn, *args, **kwargs)
 
 
-async def check_media_folder(folder: str, fn, *args, **kwargs):
-    """Media-folder work for a request that must answer, with a deadline.
+async def media_folder_or_503(folder: str, fn, *args, **kwargs):
+    """Media-folder work for a page that must answer a browser, with a deadline.
 
-    Past the deadline the request answers 503 naming the media folder, and the
-    warning says which folder gave no answer. The worker still waiting on the
-    mount cannot be cancelled: it stays in the media pool."""
+    Only the library and show pages use it. Past the deadline the page answers
+    503 naming the media folder, and the warning says which folder gave no
+    answer. A job and a legacy request have no deadline: they wait in
+    in_media_pool, and only they wait. The worker still waiting on the mount
+    cannot be cancelled: it stays in the media pool."""
     try:
         return await asyncio.wait_for(run_in(MEDIA_POOL, fn, *args, **kwargs),
                                       MEDIA_FOLDER_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         logger.warning(f"MEDIA FOLDER {folder}: no answer within {MEDIA_FOLDER_TIMEOUT_SECONDS} s")
         raise HTTPException(503, f"The media folder is not answering ({folder})")
-
-
-def media_folder_of(server) -> str:
-    """The folder a server's files map to, as this backend sees them: the name a
-    media-folder timeout reports."""
-    return ", ".join(sorted({local for _server_path, local in server.path_map.rules}))
 
 
 async def run_translate_job(job, report) -> tuple[str, str]:
@@ -1177,8 +1182,8 @@ async def library_endpoint(server_name: str, lang: LangCode = DEFAULT_TARGET_LAN
     server = _server(server_name)
     titles, episodes_by_show = await _library(server_name, refresh)
     active = jobs.active_targets(DB_FILE)
-    badges = iter(await check_media_folder(media_folder_of(server), _badge_statuses,
-                                          _badge_order(titles, episodes_by_show), lang, active))
+    badges = iter(await media_folder_or_503(server.media_folder, _badge_statuses,
+                                            _badge_order(titles, episodes_by_show), lang, active))
     result = []
     for title in titles:
         entry = {"id": title.id, "kind": title.kind, "name": title.name, "year": title.year,
@@ -1216,8 +1221,8 @@ async def show_endpoint(server_name: str, show_id: str, lang: LangCode = DEFAULT
     except MediaServerError as e:
         raise HTTPException(502, str(e))
     active = jobs.active_targets(DB_FILE)
-    statuses = await check_media_folder(media_folder_of(server), _badge_statuses,
-                                        episodes, lang, active)
+    statuses = await media_folder_or_503(server.media_folder, _badge_statuses,
+                                         episodes, lang, active)
     seasons: dict[int, list] = {}
     for e, status in zip(episodes, statuses):
         seasons.setdefault(e.season, []).append({

@@ -14,6 +14,11 @@ TIMEOUT = 15
 POSTER_TIMEOUT = 3   # a hung server must not hold browser connections for long
 
 
+# The container's media folder (GLOSSARY: media folder): the folder every path
+# map rule maps into. docker-compose.yml mounts ${MEDIA}/media here.
+MEDIA_FOLDER = "/media"
+
+
 class PathMap:
     """Comma-separated server_path:backend_path pairs, longest prefix wins."""
 
@@ -28,6 +33,12 @@ class PathMap:
                 raise ValueError(f"Path map entry {pair!r} must be server_path:backend_path")
             self.rules.append((server.strip().rstrip("/"), local.strip().rstrip("/")))
         self.rules.sort(key=lambda rule: len(rule[0]), reverse=True)
+
+    def local_roots(self) -> list[str]:
+        """The media-folder roots these rules map into, in order.
+
+        They name the folders this backend opens this server's files from."""
+        return sorted({local for _server, local in self.rules})
 
     def to_local(self, server_path: str | None) -> str | None:
         if not server_path:
@@ -80,6 +91,14 @@ class _Server:
         self.headers = {**self._auth_headers(token), "Accept": "application/json"}
         self.path_map = path_map
         self.http = http or requests.Session()
+
+    @property
+    def media_folder(self) -> str:
+        """The media folder this server's files live in, as this backend names it.
+
+        A server with no path-map rule names the container's mount, so an error
+        about the media folder always names a folder."""
+        return ", ".join(self.path_map.local_roots()) or MEDIA_FOLDER
 
     def _auth_headers(self, token: str) -> dict:
         """The headers this server authenticates with."""
@@ -174,8 +193,8 @@ class Jellyfin(_Server):
         """The movies and shows this backend can translate.
 
         An item becomes a title only when Jellyfin reports it as the type that
-        library kind holds (JELLYFIN_TITLE_TYPES), because Jellyfin also
-        answers a library with its collection items.
+        library kind holds (JELLYFIN_TITLE_TYPES), because Jellyfin also answers
+        a library with the box sets its grouping settings put there.
         """
         titles: dict[str, Title] = {}   # by item id: two libraries can hold the same file
         for kind, library_ids in self._libraries_by_kind().items():

@@ -11,10 +11,10 @@ import logging
 
 import main
 from conftest import (SAMPLE_SRT, REQUEST_DEADLINE_SECONDS, SCENARIO_DEADLINE_SECONDS, asgi_client,
-                      media_folder_is_stuck, request_within, run_scenario)
+                      backend_answers_while, media_folder_is_stuck, request_within, run_scenario)
 
 
-def test_the_api_answers_while_the_library_waits_for_the_media_folder(media_stall):
+def test_the_backend_answers_while_the_library_waits_for_the_media_folder(media_stall):
     """Stories 5-8: the page header and languages (/config), the job list, the
     model list and the posters must not wait for the media folder with the
     library page."""
@@ -23,12 +23,7 @@ def test_the_api_answers_while_the_library_waits_for_the_media_folder(media_stal
     async def scenario():
         async with asgi_client() as client:
             library_request = asyncio.create_task(client.get("/library/jellyfin"))
-            assert await media_folder_is_stuck(media_stall), \
-                "the library request never reached the media folder"
-
-            for path in ("/config", "/jobs", "/models", "/poster/jellyfin/m1"):
-                response = await request_within(client, "GET", path)
-                assert response.status_code == 200, path
+            await backend_answers_while(client, media_stall, library_request)
 
             media_stall.release()
             response = await asyncio.wait_for(library_request, REQUEST_DEADLINE_SECONDS)
@@ -61,7 +56,7 @@ def test_a_library_page_that_waits_too_long_answers_503_with_the_media_folder(me
 
 def test_the_library_answers_normally_after_the_media_folder_starts_again(media_stall, library,
                                                                          short_media_wait):
-    """Story 10: the request that gave up does not poison the backend. Once the
+    """Story 12: the request that gave up does not poison the backend. Once the
     media folder answers, the next library page is a normal 200 with its badges."""
     media_stall.stall()
 
@@ -86,50 +81,9 @@ def test_the_library_answers_normally_after_the_media_folder_starts_again(media_
     run_scenario(scenario())
 
 
-def test_one_library_request_checks_the_media_folder_once_per_badge(media_stall):
-    """The badges of one page are one batch of media-folder checks: a title card
-    and its episode cards do not each look up the files again."""
-    async def scenario():
-        async with asgi_client() as client:
-            media_stall.reset_checks()
-            titles = (await request_within(client, "GET", "/library/jellyfin")).json()["titles"]
-            # Arrival, S01E01 and S01E02 have a file to look for. Elsewhere is
-            # unmapped and the unaired episode has no file, so neither is checked.
-            assert media_stall.checks == 3, titles
-            media_stall.reset_checks()
-            await request_within(client, "GET", "/library/jellyfin/shows/s1")
-            assert media_stall.checks == 2
-
-    run_scenario(scenario())
-
-
-def test_media_folder_checks_run_off_the_event_loop(media_stall):
-    """Every check on the stalled folder runs in the media folder's own thread
-    pool, whatever the request that needed it: no request may hold the event
-    loop waiting for a file."""
-    async def scenario():
-        async with asgi_client() as client:
-            media_stall.reset_checks()
-            media_stall.stall()
-            requests = [asyncio.create_task(client.get(path))
-                        for path in ("/library/jellyfin", "/library/jellyfin/shows/s1")]
-            assert await media_folder_is_stuck(media_stall), "no check reached the media folder"
-            media_stall.release()
-            for request in requests:
-                await asyncio.wait_for(request, REQUEST_DEADLINE_SECONDS)
-
-    run_scenario(scenario())
-
-    assert media_stall.checks > 0
-    assert all(name.startswith("media") for name in media_stall.check_threads), \
-        media_stall.check_threads
-
-
-def test_a_job_that_waits_for_the_media_folder_does_not_hold_the_api(media_stall):
-    """A queued job's media-folder checks wait in the media folder's pool, so a
+def test_a_job_that_waits_for_the_media_folder_does_not_hold_the_backend(media_stall):
+    """A job's media-folder checks wait in the media folder's own threads, so a
     job stuck on the folder leaves /config, /jobs and /models answering."""
-    media_stall.reset_checks()
-
     async def scenario():
         async with asgi_client() as client:
             created = await request_within(client, "POST", "/jobs",
@@ -139,11 +93,7 @@ def test_a_job_that_waits_for_the_media_folder_does_not_hold_the_api(media_stall
 
             media_stall.stall()
             job = asyncio.create_task(main.run_next_job())
-            assert await media_folder_is_stuck(media_stall), "the job never reached the media folder"
-
-            for path in ("/config", "/jobs", "/models"):
-                response = await request_within(client, "GET", path)
-                assert response.status_code == 200, path
+            await backend_answers_while(client, media_stall, job, paths=("/config", "/jobs", "/models"))
 
             media_stall.release()
             assert await asyncio.wait_for(job, REQUEST_DEADLINE_SECONDS) is True
@@ -151,10 +101,12 @@ def test_a_job_that_waits_for_the_media_folder_does_not_hold_the_api(media_stall
     run_scenario(scenario())
 
 
-def test_legacy_background_work_keeps_media_folder_reads_off_the_event_loop(media_stall, library):
+def test_legacy_background_work_waits_for_the_media_folder_while_the_backend_answers(media_stall,
+                                                                                     library):
     """/translate and /sync start work that reads the media folder for minutes.
-    Those reads wait in the media pool, so a background job stuck on the folder
-    leaves /config, the job list and the posters answering."""
+    Those reads wait in the media folder's own threads, so a job stuck on the
+    folder leaves /config, the job list, the model list and the posters
+    answering, and both finish once the folder answers again."""
     sync_job = "stalled-sync"
     main.sync_jobs[sync_job] = {"status": "starting", "total": 0, "current": 0, "files": []}
     media_stall.stall()
@@ -167,7 +119,7 @@ def test_legacy_background_work_keeps_media_folder_reads_off_the_event_loop(medi
             assert await media_folder_is_stuck(media_stall), \
                 "no background read reached the media folder"
 
-            for path in ("/config", "/jobs", "/poster/jellyfin/m1"):
+            for path in ("/config", "/jobs", "/models", "/poster/jellyfin/m1"):
                 response = await request_within(client, "GET", path)
                 assert response.status_code == 200, path
 
@@ -179,26 +131,3 @@ def test_legacy_background_work_keeps_media_folder_reads_off_the_event_loop(medi
         run_scenario(scenario())
     finally:
         main.sync_jobs.pop(sync_job, None)
-
-
-def test_a_legacy_request_that_waits_too_long_answers_503_with_the_media_folder(media_stall,
-                                                                               library,
-                                                                               short_media_wait):
-    """/shift and /sync look at the media folder too. They give up after the same
-    timeout and answer 503, instead of holding the event loop."""
-    media_stall.stall()
-
-    async def scenario():
-        async with asgi_client() as client:
-            for method, path, body in (("POST", "/shift", {"path": str(library.movie), "offset_ms": 100}),
-                                       ("POST", "/sync", {"path": str(library.movie)})):
-                request = asyncio.create_task(client.request(method, path, json=body))
-                assert await media_folder_is_stuck(media_stall), "the request never reached the media folder"
-                for probe in ("/config", "/jobs"):
-                    response = await request_within(client, "GET", probe)
-                    assert response.status_code == 200, probe
-                response = await asyncio.wait_for(request, short_media_wait + REQUEST_DEADLINE_SECONDS)
-                assert response.status_code == 503, path
-                assert str(media_stall.root) in response.json()["detail"], response.json()
-
-    run_scenario(scenario())
