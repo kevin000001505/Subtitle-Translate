@@ -1,36 +1,9 @@
 import asyncio
 import subprocess
 
-import pytest
-from fastapi.testclient import TestClient
-
 import jobs
 import main
-from conftest import SAMPLE_SRT, FakeJellyfinHttp, jellyfin_routes
-from media_servers import Jellyfin, PathMap
-
-
-@pytest.fixture
-def library(tmp_path, monkeypatch, llama):
-    root = tmp_path / "lib"
-    movie = root / "Movies" / "Arrival (2016)"
-    show = root / "TV" / "Severance"
-    movie.mkdir(parents=True)
-    show.mkdir(parents=True)
-    for video in (movie / "Arrival.mkv", show / "S01E01.mkv", show / "S01E02.mkv"):
-        video.write_bytes(b"")
-        video.with_suffix(".en.srt").write_text(SAMPLE_SRT)
-    http = FakeJellyfinHttp(jellyfin_routes())
-    server = Jellyfin("http://jf:8096", "secret-key", PathMap(f"/data/media:{root}"), http)
-    monkeypatch.setattr(main, "SERVERS", {"jellyfin": server})
-    monkeypatch.setattr(main, "_library_cache", {})
-    monkeypatch.setattr(main, "_gemini_blocked_until", 0.0)
-
-    class Library:
-        pass
-    lib = Library()
-    lib.root, lib.movie, lib.show, lib.http, lib.client = root, movie, show, http, TestClient(main.app)
-    return lib
+from conftest import SAMPLE_SRT
 
 
 def statuses(lib, lang="zh-TW"):
@@ -68,6 +41,21 @@ def test_the_path_map_warning_counts_only_files_in_movies_and_shows_libraries(li
     assert "1 file(s) are outside JELLYFIN_PATH_MAP" in caplog.text
     assert "Elsewhere.mkv" in caplog.text
     assert "/data/JellyBridge/Discover" not in caplog.text
+
+
+def test_a_box_set_inside_a_movies_or_shows_library_is_not_listed_as_a_title(library, caplog):
+    """With "group movies into collections" on, Jellyfin answers the Movies
+    library with BoxSet items even though the request asks for
+    IncludeItemTypes=Movie, and the Shows library the same way. A box set is not
+    a title: it has no subtitle to translate, and its path is a folder in
+    Jellyfin's config, so listing it would add a false "unmapped" card and a
+    false file in the path-map warning."""
+    titles = library.client.get("/library/jellyfin").json()["titles"]
+
+    assert [(t["id"], t["name"]) for t in titles] == [
+        ("m1", "Arrival"), ("m2", "Elsewhere"), ("s1", "Severance")]
+    assert "Collection" not in caplog.text
+    assert "1 file(s) are outside JELLYFIN_PATH_MAP" in caplog.text
 
 
 def test_badges_follow_the_files_and_the_language(library):
@@ -247,6 +235,18 @@ def test_show_page_lists_seasons_and_episode_status(library):
 
     assert [(s["season"], [(e["number"], e["status"]) for e in s["episodes"]]) for s in seasons] == [
         (1, [(1, "missing"), (2, "done")]), (2, [(1, "unavailable")])]
+
+
+def test_a_special_in_a_shows_library_is_not_listed_as_an_episode(library):
+    """The Shows library holds a behind-the-scenes special with a real file. It
+    is not an episode, so it never reaches the show page or a queued show."""
+    seasons = library.client.get("/library/jellyfin/shows/s1").json()["seasons"]
+    library.client.post("/jobs", json={"server": "jellyfin", "items": [{"kind": "show", "id": "s1"}]})
+
+    assert [(s["season"], [e["id"] for e in s["episodes"]]) for s in seasons] == [
+        (1, ["e1", "e2"]), (2, ["e3"])]
+    assert [j["title"] for j in library.client.get("/jobs").json()["jobs"]] == [
+        "Severance S01E01", "Severance S01E02"]
 
 
 # ---- review / QA fixes ----

@@ -16,6 +16,7 @@ Prerequisite: Docker with the Compose plugin.
 2. Create `.env` from the example and fill in the values. The comments in `.env.example` explain every entry; in particular:
 
    - `MEDIA` — the host folder that holds your media folder; `${MEDIA}/media` is mounted at `/media` in the backend. Use the same value as the `MEDIA` your media server stack uses.
+   - `MEDIA_FOLDER_TIMEOUT_SECONDS` — how long a library page or show page waits for the media folder before it answers 503 naming that folder. Keep it below the frontend proxy's own timeout (nginx waits 60 s). Translation, shift and sync jobs, and the legacy endpoints, are not bound by it.
    - `GEMINI_API_KEY` — leave it empty to turn Gemini off.
    - The Jellyfin / Plex entries are called from inside the backend container, so use an address it can reach (an address on the local network, or its service name if it is on the same Docker network).
 

@@ -14,6 +14,11 @@ TIMEOUT = 15
 POSTER_TIMEOUT = 3   # a hung server must not hold browser connections for long
 
 
+# The container's media folder (GLOSSARY: media folder): the folder every path
+# map rule maps into. docker-compose.yml mounts ${MEDIA}/media here.
+MEDIA_FOLDER = "/media"
+
+
 class PathMap:
     """Comma-separated server_path:backend_path pairs, longest prefix wins."""
 
@@ -28,6 +33,12 @@ class PathMap:
                 raise ValueError(f"Path map entry {pair!r} must be server_path:backend_path")
             self.rules.append((server.strip().rstrip("/"), local.strip().rstrip("/")))
         self.rules.sort(key=lambda rule: len(rule[0]), reverse=True)
+
+    def local_roots(self) -> list[str]:
+        """The media-folder roots these rules map into, in order.
+
+        They name the folders this backend opens this server's files from."""
+        return sorted({local for _server, local in self.rules})
 
     def to_local(self, server_path: str | None) -> str | None:
         if not server_path:
@@ -81,6 +92,14 @@ class _Server:
         self.path_map = path_map
         self.http = http or requests.Session()
 
+    @property
+    def media_folder(self) -> str:
+        """The media folder this server's files live in, as this backend names it.
+
+        A server with no path-map rule names the container's mount, so an error
+        about the media folder always names a folder."""
+        return ", ".join(self.path_map.local_roots()) or MEDIA_FOLDER
+
     def _auth_headers(self, token: str) -> dict:
         """The headers this server authenticates with."""
         return {self.token_header: token}
@@ -103,6 +122,25 @@ def _by_episode(episodes):
 # Jellyfin library types whose items can be translated, mapped to the title
 # kind each one holds. _libraries_by_kind says why every other type is skipped.
 JELLYFIN_LIBRARY_TYPES = {"movies": "movie", "tvshows": "show"}
+
+# The item type each title kind holds. Jellyfin answers a library with items of
+# other types as well: with "group movies into collections" on, the Movies
+# library also returns BoxSet items, even though the request asks for
+# IncludeItemTypes=Movie. The item's own Type decides what becomes a title.
+JELLYFIN_TITLE_TYPES = {"movie": "Movie", "show": "Series"}
+
+# Episode lookups follow the same rule: only an Episode is an episode.
+JELLYFIN_EPISODE_TYPE = "Episode"
+
+
+def _type_matches(item, expected: str) -> bool:
+    """Whether Jellyfin says this item is the type being read.
+
+    An item whose Type is absent is kept: /Items always reports Type in real
+    Jellyfin, and a lookup that asks for no type leaves the field out.
+    """
+    actual = item.get("Type")
+    return not actual or actual == expected
 
 
 class Jellyfin(_Server):
@@ -152,6 +190,12 @@ class Jellyfin(_Server):
         return by_kind
 
     def titles(self) -> list[Title]:
+        """The movies and shows this backend can translate.
+
+        An item becomes a title only when Jellyfin reports it as the type that
+        library kind holds (JELLYFIN_TITLE_TYPES), because Jellyfin also answers
+        a library with the box sets its grouping settings put there.
+        """
         titles: dict[str, Title] = {}   # by item id: two libraries can hold the same file
         for kind, library_ids in self._libraries_by_kind().items():
             for library_id in library_ids:
@@ -164,6 +208,8 @@ class Jellyfin(_Server):
                     "SortOrder": "Ascending",
                 })
                 for item in data.get("Items", []):
+                    if not _type_matches(item, JELLYFIN_TITLE_TYPES[kind]):
+                        continue
                     server_path = item.get("Path") if kind == "movie" else None
                     titles.setdefault(item["Id"], Title(
                         id=item["Id"], kind=kind, name=item.get("Name", ""),
@@ -173,6 +219,7 @@ class Jellyfin(_Server):
         return sorted(titles.values(), key=lambda t: t.name.lower())
 
     def episodes_by_show(self) -> dict[str, list[Episode]]:
+        """Every episode of every show in the tvshows libraries."""
         by_show: dict[str, list[Episode]] = {}
         seen: set[str] = set()   # two libraries can hold the same file: count it once
         for library_id in self._libraries_by_kind().get("show", []):
@@ -183,6 +230,8 @@ class Jellyfin(_Server):
                 "Fields": "Path",
             })
             for item in data.get("Items", []):
+                if not _type_matches(item, JELLYFIN_EPISODE_TYPE):
+                    continue
                 if item["Id"] in seen:
                     continue
                 seen.add(item["Id"])
@@ -190,8 +239,10 @@ class Jellyfin(_Server):
         return {show: _by_episode(episodes) for show, episodes in by_show.items()}
 
     def episodes(self, show_id: str) -> list[Episode]:
+        """The episodes of one show, as its own page lists them."""
         data = self._call("GET", f"/Shows/{show_id}/Episodes", params={"Fields": "Path"})
-        episodes = [self._episode(item) for item in data.get("Items", [])]
+        episodes = [self._episode(item) for item in data.get("Items", [])
+                    if _type_matches(item, JELLYFIN_EPISODE_TYPE)]
         return _by_episode(episodes)
 
     def poster(self, item_id: str):

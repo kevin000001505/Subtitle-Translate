@@ -42,6 +42,15 @@ def is_source_subtitle(path: str) -> bool:
     return path.lower().endswith(subtitle_suffix(SOURCE_LANG))
 
 
+# The video files whose sidecar subtitle this backend reads and writes.
+VIDEO_SUFFIXES = (".mkv", ".mp4")
+
+
+def is_video_file(path: str) -> bool:
+    """Whether `path` is a video file this backend can take a subtitle from."""
+    return path.lower().endswith(VIDEO_SUFFIXES)
+
+
 def strip_source_suffix(path: str) -> str:
     """`Movie.en.srt` -> `Movie`, for a path is_source_subtitle accepts."""
     return path[:-len(subtitle_suffix(SOURCE_LANG))]

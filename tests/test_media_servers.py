@@ -2,7 +2,7 @@ import pytest
 
 from conftest import (FakeHttp, FakeJellyfinHttp, JELLYFIN_EPISODES, JELLYFIN_ITEMS, JELLYFIN_LIBRARIES,
                       SEVERANCE_EPISODES, jellyfin_routes)
-from media_servers import Jellyfin, MediaServerError, PathMap, Plex, configured_servers
+from media_servers import MEDIA_FOLDER, Jellyfin, MediaServerError, PathMap, Plex, configured_servers
 
 
 def test_a_server_path_maps_to_the_backend_media_folder():
@@ -23,6 +23,20 @@ def test_a_path_no_rule_covers_maps_to_nothing():
 def test_a_malformed_path_map_is_refused():
     with pytest.raises(ValueError):
         PathMap("/data/media")
+
+
+def test_a_servers_media_folder_names_the_folders_its_rules_map_into():
+    """A page that gives up on a stalled media folder names it (GLOSSARY: media
+    folder), so the error points at the mount, not at the media server."""
+    server = Jellyfin("http://jf:8096", "key", PathMap("/data:/other,/data/media:/media"))
+    assert server.media_folder == "/media, /other"
+
+
+def test_a_server_with_no_path_map_names_the_containers_media_folder():
+    """A server with no rule holds no file this backend can open, but an error
+    about its media folder still names a folder."""
+    server = Jellyfin("http://jf:8096", "key", PathMap(""))
+    assert server.media_folder == MEDIA_FOLDER == "/media"
 
 
 def jellyfin(http=None):
@@ -49,6 +63,19 @@ def test_jellyfin_lists_only_titles_from_movies_and_tvshows_libraries():
         ("m2", "movie", "Elsewhere"),
         ("s1", "show", "Severance"),
     ]
+
+
+def test_jellyfin_leaves_out_library_items_that_are_not_movies_or_shows():
+    """The shared fixture puts a movie box set in the Movies library and a show
+    box set in the Shows library, the way Jellyfin does when its grouping
+    settings are on. An item becomes a title only when its own Type matches the
+    kind being read."""
+    box_sets_in_a_title_library = [(item["Id"], item["ParentId"])
+                                   for item in JELLYFIN_ITEMS["Items"]
+                                   if item["Type"] == "BoxSet" and item["ParentId"] in ("lib-movies", "lib-shows")]
+
+    assert box_sets_in_a_title_library == [("bx1", "lib-movies"), ("bx2", "lib-shows")]
+    assert [t.id for t in jellyfin().titles()] == ["m1", "m2", "s1"]
 
 
 def test_jellyfin_sends_its_api_key_in_the_authorization_header():
@@ -79,6 +106,29 @@ def test_jellyfin_episode_lookup_uses_only_tvshows_libraries():
     assert {show: [e.id for e in episodes] for show, episodes in by_show.items()} == {
         "s1": ["e1", "e2", "e3"],
     }
+
+
+def test_jellyfin_episode_lookups_keep_only_episodes():
+    """Only Episode items become episodes.
+
+    A show's library can hold other items with a real file - the fixture reports
+    a behind-the-scenes special as a Movie - and a phantom episode would add a
+    row to the show page and a job to a show queue.
+    """
+    assert [item["Id"] for item in SEVERANCE_EPISODES if item.get("Type")] == ["sp1"]
+
+    assert [e.id for e in jellyfin().episodes("s1")] == ["e1", "e2", "e3"]
+    assert [e.id for e in jellyfin().episodes_by_show()["s1"]] == ["e1", "e2", "e3"]
+
+
+def test_jellyfin_lists_an_episode_that_reports_no_type():
+    """Real Jellyfin reports Type for every /Items result. A lookup that asks for
+    no type leaves the field out, and an absent Type never drops an item: the
+    episode fixtures report no Type and are still listed."""
+    episodes_without_a_type = [item["Id"] for item in SEVERANCE_EPISODES if "Type" not in item]
+
+    assert episodes_without_a_type == ["e2", "e1", "e3"]
+    assert [e.id for e in jellyfin().episodes("s1")] == ["e1", "e2", "e3"]
 
 
 def test_a_jellyfin_server_without_movies_or_shows_libraries_lists_an_empty_library():
