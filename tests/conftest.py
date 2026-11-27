@@ -167,28 +167,56 @@ class FakeHttp:
         return resp
 
 
+# Jellyfin's libraries ("virtual folders") and the items inside them.
+# Jellyfin reports a collection type per library; Discover has none (it is the
+# JellyBridge placeholder library) and Collections is a boxsets library.
+JELLYFIN_LIBRARIES = [
+    {"Name": "Movies", "CollectionType": "movies", "ItemId": "lib-movies",
+     "Locations": ["/data/media/Movies"]},
+    {"Name": "Shows", "CollectionType": "tvshows", "ItemId": "lib-shows",
+     "Locations": ["/data/media/TV"]},
+    {"Name": "Discover", "ItemId": "lib-discover", "Locations": ["/data/JellyBridge/Discover"]},
+    {"Name": "Collections", "CollectionType": "boxsets", "ItemId": "lib-boxsets",
+     "Locations": ["/data/media/Movies/Collections"]},
+]
+
 JELLYFIN_ITEMS = {"Items": [
     {"Id": "m1", "Name": "Arrival", "Type": "Movie", "ProductionYear": 2016,
-     "Path": "/data/media/Movies/Arrival (2016)/Arrival.mkv"},
+     "Path": "/data/media/Movies/Arrival (2016)/Arrival.mkv", "ParentId": "lib-movies"},
     {"Id": "m2", "Name": "Elsewhere", "Type": "Movie", "ProductionYear": 2020,
-     "Path": "/data/JellyBridge/Elsewhere.mkv"},
-    {"Id": "s1", "Name": "Severance", "Type": "Series", "ProductionYear": 2022},
-], "TotalRecordCount": 3}
+     "Path": "/data/JellyBridge/Elsewhere.mkv", "ParentId": "lib-movies"},
+    {"Id": "s1", "Name": "Severance", "Type": "Series", "ProductionYear": 2022,
+     "ParentId": "lib-shows"},
+    {"Id": "d1", "Name": "Dune", "Type": "Movie", "ProductionYear": 2021,
+     "Path": "/data/JellyBridge/Discover/Dune (2021)/Dune.mkv", "ParentId": "lib-discover"},
+    {"Id": "c1", "Name": "Blade Runner Collection", "Type": "Movie",
+     "ProductionYear": None, "Path": "/data/media/Movies/Collections/Blade Runner",
+     "ParentId": "lib-boxsets"},
+], "TotalRecordCount": 5}
 
-JELLYFIN_EPISODES = {"Items": [
+SEVERANCE_EPISODES = [  # in the Shows library
     {"Id": "e2", "Name": "Half Loop", "SeriesId": "s1", "ParentIndexNumber": 1, "IndexNumber": 2,
-     "Path": "/data/media/TV/Severance/S01E02.mkv", "LocationType": "FileSystem"},
+     "Path": "/data/media/TV/Severance/S01E02.mkv", "LocationType": "FileSystem", "ParentId": "lib-shows"},
     {"Id": "e1", "Name": "Good News", "SeriesId": "s1", "ParentIndexNumber": 1, "IndexNumber": 1,
-     "Path": "/data/media/TV/Severance/S01E01.mkv", "LocationType": "FileSystem"},
+     "Path": "/data/media/TV/Severance/S01E01.mkv", "LocationType": "FileSystem", "ParentId": "lib-shows"},
     {"Id": "e3", "Name": "Unaired", "SeriesId": "s1", "ParentIndexNumber": 2, "IndexNumber": 1,
-     "LocationType": "Virtual"},
-]}
+     "LocationType": "Virtual", "ParentId": "lib-shows"},
+]
+
+DISCOVER_EPISODES = [  # placeholder file in the Discover library
+    {"Id": "e4", "Name": "Dolor", "SeriesId": "s2", "ParentIndexNumber": 1, "IndexNumber": 1,
+     "Path": "/data/JellyBridge/Discover/The Expanse (2015)/S01E01.mkv",
+     "LocationType": "FileSystem", "ParentId": "lib-discover"},
+]
+
+JELLYFIN_EPISODES = {"Items": SEVERANCE_EPISODES + DISCOVER_EPISODES}
 
 
-def jellyfin_routes():
+def jellyfin_routes(libraries=None):
     return {
         ("GET", "/Items"): None,  # filled per call type below
-        ("GET", "/Shows/s1/Episodes"): JELLYFIN_EPISODES,
+        ("GET", "/Library/VirtualFolders"): JELLYFIN_LIBRARIES if libraries is None else libraries,
+        ("GET", "/Shows/s1/Episodes"): {"Items": SEVERANCE_EPISODES, "TotalRecordCount": 3},
         ("GET", "/Items/m1/Images/Primary"): b"poster-bytes",
         ("POST", "/Items/m1/Refresh"): b"",
         ("POST", "/Items/e1/Refresh"): b"",
@@ -196,14 +224,18 @@ def jellyfin_routes():
 
 
 class FakeJellyfinHttp(FakeHttp):
-    """/Items answers with titles or with all episodes depending on IncludeItemTypes;
-    set episode_items to change the episode listing."""
+    """/Library/VirtualFolders answers with the configured libraries.
+    /Items answers with titles or with all episodes depending on IncludeItemTypes,
+    and only with the items of the library (ParentId) the request asked about.
+    Set episode_items to change the episode listing."""
 
     episode_items = None
 
     def request(self, method, url, params=None, headers=None, timeout=None):
         if url.endswith("/Items") and params:
             episodes = self.episode_items or JELLYFIN_EPISODES
-            self.routes[("GET", "/Items")] = (
-                episodes if params.get("IncludeItemTypes") == "Episode" else JELLYFIN_ITEMS)
+            body = episodes if params.get("IncludeItemTypes") == "Episode" else JELLYFIN_ITEMS
+            parent = params.get("ParentId")
+            items = [item for item in body["Items"] if not parent or item.get("ParentId") == parent]
+            self.routes[("GET", "/Items")] = {"Items": items, "TotalRecordCount": len(items)}
         return super().request(method, url, params, headers, timeout)

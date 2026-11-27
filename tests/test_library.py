@@ -60,6 +60,16 @@ def test_the_library_lists_posters_and_subtitle_status(library):
                                  "Severance": ("missing", 0, 2)}
 
 
+def test_the_path_map_warning_counts_only_files_in_movies_and_shows_libraries(library, caplog):
+    """Only Elsewhere is a Movies-library file the path map misses. The
+    placeholder files in the Discover library are not in the library at all."""
+    library.client.get("/library/jellyfin")
+
+    assert "1 file(s) are outside JELLYFIN_PATH_MAP" in caplog.text
+    assert "Elsewhere.mkv" in caplog.text
+    assert "/data/JellyBridge/Discover" not in caplog.text
+
+
 def test_badges_follow_the_files_and_the_language(library):
     (library.movie / "Arrival.zh-TW.srt").write_text(SAMPLE_SRT)
     (library.show / "S01E01.zh-TW.srt").write_text(SAMPLE_SRT)
