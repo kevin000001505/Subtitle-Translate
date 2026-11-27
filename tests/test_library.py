@@ -264,6 +264,18 @@ def test_show_page_lists_seasons_and_episode_status(library):
         (1, [(1, "missing"), (2, "done")]), (2, [(1, "unavailable")])]
 
 
+def test_a_special_in_a_shows_library_is_not_listed_as_an_episode(library):
+    """The Shows library holds a behind-the-scenes special with a real file. It
+    is not an episode, so it never reaches the show page or a queued show."""
+    seasons = library.client.get("/library/jellyfin/shows/s1").json()["seasons"]
+    library.client.post("/jobs", json={"server": "jellyfin", "items": [{"kind": "show", "id": "s1"}]})
+
+    assert [(s["season"], [e["id"] for e in s["episodes"]]) for s in seasons] == [
+        (1, ["e1", "e2"]), (2, ["e3"])]
+    assert [j["title"] for j in library.client.get("/jobs").json()["jobs"]] == [
+        "Severance S01E01", "Severance S01E02"]
+
+
 # ---- review / QA fixes ----
 
 def test_translating_to_the_source_language_is_refused(library):

@@ -94,6 +94,29 @@ def test_jellyfin_episode_lookup_uses_only_tvshows_libraries():
     }
 
 
+def test_jellyfin_episode_lookups_keep_only_episodes():
+    """Only Episode items become episodes.
+
+    A show's library can hold other items with a real file - the fixture reports
+    a behind-the-scenes special as a Movie - and a phantom episode would add a
+    row to the show page and a job to a show queue.
+    """
+    assert [item["Id"] for item in SEVERANCE_EPISODES if item.get("Type")] == ["sp1"]
+
+    assert [e.id for e in jellyfin().episodes("s1")] == ["e1", "e2", "e3"]
+    assert [e.id for e in jellyfin().episodes_by_show()["s1"]] == ["e1", "e2", "e3"]
+
+
+def test_jellyfin_lists_an_episode_that_reports_no_type():
+    """Real Jellyfin reports Type for every /Items result. A lookup that asks for
+    no type leaves the field out, and an absent Type never drops an item: the
+    episode fixtures report no Type and are still listed."""
+    episodes_without_a_type = [item["Id"] for item in SEVERANCE_EPISODES if "Type" not in item]
+
+    assert episodes_without_a_type == ["e2", "e1", "e3"]
+    assert [e.id for e in jellyfin().episodes("s1")] == ["e1", "e2", "e3"]
+
+
 def test_a_jellyfin_server_without_movies_or_shows_libraries_lists_an_empty_library():
     other_libraries = [folder for folder in JELLYFIN_LIBRARIES
                        if folder.get("CollectionType") not in ("movies", "tvshows")]

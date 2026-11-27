@@ -212,6 +212,12 @@ SEVERANCE_EPISODES = [  # in the Shows library
      "Path": "/data/media/TV/Severance/S01E01.mkv", "LocationType": "FileSystem", "ParentId": "lib-shows"},
     {"Id": "e3", "Name": "Unaired", "SeriesId": "s1", "ParentIndexNumber": 2, "IndexNumber": 1,
      "LocationType": "Virtual", "ParentId": "lib-shows"},
+    # A behind-the-scenes special, reported inside the Shows library and by the
+    # show's own episode list. It has a real file, but it is not an Episode.
+    {"Id": "sp1", "Name": "Severance Behind the Scenes", "Type": "Movie", "SeriesId": "s1",
+     "ParentIndexNumber": 1, "IndexNumber": 99,
+     "Path": "/data/media/TV/Severance/Behind the Scenes.mkv", "LocationType": "FileSystem",
+     "ParentId": "lib-shows"},
 ]
 
 DISCOVER_EPISODES = [  # placeholder file in the Discover library

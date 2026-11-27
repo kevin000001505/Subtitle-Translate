@@ -110,6 +110,9 @@ JELLYFIN_LIBRARY_TYPES = {"movies": "movie", "tvshows": "show"}
 # IncludeItemTypes=Movie. The item's own Type decides what becomes a title.
 JELLYFIN_TITLE_TYPES = {"movie": "Movie", "show": "Series"}
 
+# Episode lookups follow the same rule: only an Episode is an episode.
+JELLYFIN_EPISODE_TYPE = "Episode"
+
 
 def _type_matches(item, expected: str) -> bool:
     """Whether Jellyfin says this item is the type being read.
@@ -119,7 +122,6 @@ def _type_matches(item, expected: str) -> bool:
     """
     actual = item.get("Type")
     return not actual or actual == expected
-
 
 
 class Jellyfin(_Server):
@@ -198,6 +200,7 @@ class Jellyfin(_Server):
         return sorted(titles.values(), key=lambda t: t.name.lower())
 
     def episodes_by_show(self) -> dict[str, list[Episode]]:
+        """Every episode of every show in the tvshows libraries."""
         by_show: dict[str, list[Episode]] = {}
         seen: set[str] = set()   # two libraries can hold the same file: count it once
         for library_id in self._libraries_by_kind().get("show", []):
@@ -208,6 +211,8 @@ class Jellyfin(_Server):
                 "Fields": "Path",
             })
             for item in data.get("Items", []):
+                if not _type_matches(item, JELLYFIN_EPISODE_TYPE):
+                    continue
                 if item["Id"] in seen:
                     continue
                 seen.add(item["Id"])
@@ -215,8 +220,10 @@ class Jellyfin(_Server):
         return {show: _by_episode(episodes) for show, episodes in by_show.items()}
 
     def episodes(self, show_id: str) -> list[Episode]:
+        """The episodes of one show, as its own page lists them."""
         data = self._call("GET", f"/Shows/{show_id}/Episodes", params={"Fields": "Path"})
-        episodes = [self._episode(item) for item in data.get("Items", [])]
+        episodes = [self._episode(item) for item in data.get("Items", [])
+                    if _type_matches(item, JELLYFIN_EPISODE_TYPE)]
         return _by_episode(episodes)
 
     def poster(self, item_id: str):
