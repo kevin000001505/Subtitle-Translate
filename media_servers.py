@@ -77,9 +77,13 @@ class _Server:
 
     def __init__(self, url: str, token: str, path_map: PathMap, http=None):
         self.url = url.rstrip("/")
-        self.headers = {self.token_header: token, "Accept": "application/json"}
+        self.headers = {**self._auth_headers(token), "Accept": "application/json"}
         self.path_map = path_map
         self.http = http or requests.Session()
+
+    def _auth_headers(self, token: str) -> dict:
+        """The headers this server authenticates with."""
+        return {self.token_header: token}
 
     def _request(self, method, path, params=None, timeout=TIMEOUT):
         try:
@@ -99,7 +103,14 @@ def _by_episode(episodes):
 class Jellyfin(_Server):
     name = "jellyfin"
     label = "Jellyfin"
-    token_header = "X-Emby-Token"
+
+    def _auth_headers(self, token: str) -> dict:
+        """Jellyfin authenticates with an Authorization header.
+
+        The legacy X-Emby-Token header is deprecated and the current
+        Jellyfin API answers 401 for it.
+        """
+        return {"Authorization": f'MediaBrowser Token="{token}"'}
 
     def _call(self, method, path, params=None, raw=False, timeout=TIMEOUT):
         response = self._request(method, path, params, timeout)
