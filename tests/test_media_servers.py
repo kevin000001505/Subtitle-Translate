@@ -38,10 +38,12 @@ def test_jellyfin_lists_movies_and_shows_with_backend_paths():
     ]
 
 
-def test_jellyfin_sends_its_api_key():
+def test_jellyfin_sends_its_api_key_in_the_authorization_header():
     http = FakeJellyfinHttp(jellyfin_routes())
     jellyfin(http).titles()
-    assert http.calls[0]["headers"]["X-Emby-Token"] == "key"
+    headers = http.calls[0]["headers"]
+    assert headers["Authorization"] == 'MediaBrowser Token="key"'
+    assert "X-Emby-Token" not in headers
 
 
 def test_jellyfin_episodes_are_ordered_and_missing_files_have_no_path():
