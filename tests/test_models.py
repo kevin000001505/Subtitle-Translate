@@ -83,3 +83,31 @@ def test_models_are_listed_from_llama_swap_without_aliases():
 def test_an_unreachable_llama_swap_raises():
     with pytest.raises(requests.RequestException):
         translate_gemma.list_models(FakeModelsHttp(error=requests.ConnectionError("down")))
+
+
+def test_a_base_url_that_ends_in_v1_still_asks_the_models_path_once(monkeypatch):
+    monkeypatch.setattr(translate_gemma, "TRANSLATE_GEMMA_URL", "http://192.168.1.163:8080/v1")
+    http = FakeModelsHttp(LLAMA_SWAP_MODELS)
+
+    translate_gemma.list_models(http)
+
+    assert http.calls[0]["url"] == "http://192.168.1.163:8080/v1/models"
+
+
+def test_a_base_url_that_ends_in_v1_still_asks_the_chat_path_once(monkeypatch, llama):
+    monkeypatch.setattr(translate_gemma, "TRANSLATE_GEMMA_URL", "http://192.168.1.163:8080/v1/")
+    client = translate_gemma.TranslateGemmaClient()
+
+    asyncio.run(client.translate("[0] Hello", model="qwen3-14b"))
+
+    assert llama.requests[0]["url"] == "http://192.168.1.163:8080/v1/chat/completions"
+
+
+def test_a_default_model_that_is_not_a_translate_model_gets_the_plain_prompt(media, llama):
+    (media / "Movie.en.srt").write_text(SAMPLE_SRT)
+    model = "Qwen3.8-Flash-Next-IQ3_XXS-Strata"
+
+    run_process_movie(media, target_lang="ja", translator=main.Translator("llama-swap", model))
+
+    assert isinstance(llama.requests[0]["json"]["messages"][0]["content"], str)
+    assert lines(media / "Movie.ja.srt")[0] == (500, 1500, "ja: Hello")
