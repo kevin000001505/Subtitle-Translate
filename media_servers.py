@@ -1,6 +1,6 @@
-"""Jellyfin and Plex behind one library interface.
+"""The Jellyfin library behind the backend's library interface.
 
-A media server reports file paths as its own container sees them
+Jellyfin reports file paths as its own container sees them
 (e.g. /data/media/Movies/X.mkv); PathMap turns them into paths this backend
 can open (/media/Movies/X.mkv). A path no rule covers maps to None, and the
 item is shown as unavailable instead of being translated in the wrong place.
@@ -83,38 +83,6 @@ class MediaServerError(Exception):
     pass
 
 
-class _Server:
-    name = label = token_header = ""
-
-    def __init__(self, url: str, token: str, path_map: PathMap, http=None):
-        self.url = url.rstrip("/")
-        self.headers = {**self._auth_headers(token), "Accept": "application/json"}
-        self.path_map = path_map
-        self.http = http or requests.Session()
-
-    @property
-    def media_folder(self) -> str:
-        """The media folder this server's files live in, as this backend names it.
-
-        A server with no path-map rule names the container's mount, so an error
-        about the media folder always names a folder."""
-        return ", ".join(self.path_map.local_roots()) or MEDIA_FOLDER
-
-    def _auth_headers(self, token: str) -> dict:
-        """The headers this server authenticates with."""
-        return {self.token_header: token}
-
-    def _request(self, method, path, params=None, timeout=TIMEOUT):
-        try:
-            response = self.http.request(method, f"{self.url}{path}", params=params,
-                                         headers=self.headers, timeout=timeout)
-        except requests.RequestException as e:
-            raise MediaServerError(f"{self.label} is unreachable at {self.url} ({type(e).__name__})") from e
-        if response.status_code >= 400:
-            raise MediaServerError(f"{self.label} answered HTTP {response.status_code} for {path}")
-        return response
-
-
 def _by_episode(episodes):
     return sorted(episodes, key=lambda e: (e.season, e.number))
 
@@ -143,21 +111,48 @@ def _type_matches(item, expected: str) -> bool:
     return not actual or actual == expected
 
 
-class Jellyfin(_Server):
+class Jellyfin:
+    """The Jellyfin library: its titles, episodes, posters and item refreshes.
+
+    Jellyfin authenticates with an Authorization header. The legacy
+    X-Emby-Token header is deprecated and the current Jellyfin API answers 401
+    for it, so the API key from JELLYFIN_API_KEY goes in Authorization.
+    """
     name = "jellyfin"
     label = "Jellyfin"
 
-    def _auth_headers(self, token: str) -> dict:
-        """Jellyfin authenticates with an Authorization header.
+    def __init__(self, url: str, api_key: str, path_map: PathMap, http=None):
+        self.url = url.rstrip("/")
+        self.headers = {"Authorization": f'MediaBrowser Token="{api_key}"',
+                        "Accept": "application/json"}
+        self.path_map = path_map
+        self.http = http or requests.Session()
 
-        The legacy X-Emby-Token header is deprecated and the current
-        Jellyfin API answers 401 for it.
-        """
-        return {"Authorization": f'MediaBrowser Token="{token}"'}
+    @property
+    def media_folder(self) -> str:
+        """The media folder this server's files live in, as this backend names it.
 
-    def _call(self, method, path, params=None, raw=False, timeout=TIMEOUT):
-        response = self._request(method, path, params, timeout)
-        return response if raw else response.json()
+        A server with no path-map rule names the container's mount, so an error
+        about the media folder always names a folder."""
+        return ", ".join(self.path_map.local_roots()) or MEDIA_FOLDER
+
+    def _send(self, method, path, params=None, timeout=TIMEOUT):
+        """One call to Jellyfin, answered with Jellyfin's own response.
+
+        A server that cannot be reached, or that answers 4xx/5xx, becomes
+        MediaServerError naming Jellyfin, so every caller fails the same way."""
+        try:
+            response = self.http.request(method, f"{self.url}{path}", params=params,
+                                         headers=self.headers, timeout=timeout)
+        except requests.RequestException as e:
+            raise MediaServerError(f"{self.label} is unreachable at {self.url} ({type(e).__name__})") from e
+        if response.status_code >= 400:
+            raise MediaServerError(f"{self.label} answered HTTP {response.status_code} for {path}")
+        return response
+
+    def _json(self, method, path, params=None):
+        """A call answered as JSON: the form every lookup in this class reads."""
+        return self._send(method, path, params).json()
 
     def _episode(self, item) -> Episode:
         server_path = item.get("Path") if item.get("LocationType") != "Virtual" else None
@@ -175,15 +170,14 @@ class Jellyfin(_Server):
 
         Jellyfin reports one collection type per library. Only "movies" and
         "tvshows" are used; everything else (a boxsets library, the JellyBridge
-        Discover placeholder library, a library with no type) is skipped, the
-        same rule Plex applies to its library sections. Fetched once per call,
-        never per item.
+        Discover placeholder library, a library with no type) is skipped.
+        Fetched once per call, never per item.
 
         /Library/VirtualFolders needs elevation, and Jellyfin gives every API
         key the Administrator role, so the key in JELLYFIN_API_KEY can read it.
         """
         by_kind: dict[str, list[str]] = {}
-        for folder in self._call("GET", "/Library/VirtualFolders"):
+        for folder in self._json("GET", "/Library/VirtualFolders"):
             kind = JELLYFIN_LIBRARY_TYPES.get((folder.get("CollectionType") or "").lower())
             if kind and folder.get("ItemId"):
                 by_kind.setdefault(kind, []).append(folder["ItemId"])
@@ -199,7 +193,7 @@ class Jellyfin(_Server):
         titles: dict[str, Title] = {}   # by item id: two libraries can hold the same file
         for kind, library_ids in self._libraries_by_kind().items():
             for library_id in library_ids:
-                data = self._call("GET", "/Items", params={
+                data = self._json("GET", "/Items", params={
                     "ParentId": library_id,
                     "Recursive": "true",
                     "IncludeItemTypes": "Movie" if kind == "movie" else "Series",
@@ -223,7 +217,7 @@ class Jellyfin(_Server):
         by_show: dict[str, list[Episode]] = {}
         seen: set[str] = set()   # two libraries can hold the same file: count it once
         for library_id in self._libraries_by_kind().get("show", []):
-            data = self._call("GET", "/Items", params={
+            data = self._json("GET", "/Items", params={
                 "ParentId": library_id,
                 "Recursive": "true",
                 "IncludeItemTypes": "Episode",
@@ -240,96 +234,34 @@ class Jellyfin(_Server):
 
     def episodes(self, show_id: str) -> list[Episode]:
         """The episodes of one show, as its own page lists them."""
-        data = self._call("GET", f"/Shows/{show_id}/Episodes", params={"Fields": "Path"})
+        data = self._json("GET", f"/Shows/{show_id}/Episodes", params={"Fields": "Path"})
         episodes = [self._episode(item) for item in data.get("Items", [])
                     if _type_matches(item, JELLYFIN_EPISODE_TYPE)]
         return _by_episode(episodes)
 
     def poster(self, item_id: str):
-        response = self._call("GET", f"/Items/{item_id}/Images/Primary",
-                              params={"fillHeight": 450, "quality": 90}, raw=True, timeout=POSTER_TIMEOUT)
+        """The poster bytes and their content type, with a short timeout: a hung
+        server must not hold a browser connection for long."""
+        response = self._send("GET", f"/Items/{item_id}/Images/Primary",
+                              params={"fillHeight": 450, "quality": 90}, timeout=POSTER_TIMEOUT)
         return response.content, response.headers.get("Content-Type", "image/jpeg")
 
     def refresh(self, item_id: str):
-        self._call("POST", f"/Items/{item_id}/Refresh", params={
+        """Ask Jellyfin to rescan this item, so a subtitle written next to its
+        video shows up in the library."""
+        self._send("POST", f"/Items/{item_id}/Refresh", params={
             "metadataRefreshMode": "Default", "imageRefreshMode": "Default",
             "replaceAllMetadata": "false", "replaceAllImages": "false",
-        }, raw=True)
-
-
-class Plex(_Server):
-    name = "plex"
-    label = "Plex"
-    token_header = "X-Plex-Token"
-
-    def _call(self, method, path, params=None, raw=False, timeout=TIMEOUT):
-        response = self._request(method, path, params, timeout)
-        return response if raw else response.json().get("MediaContainer", {})
-
-    @staticmethod
-    def _file(item) -> str | None:
-        for media in item.get("Media", []):
-            for part in media.get("Part", []):
-                if part.get("file"):
-                    return part["file"]
-        return None
-
-    def _episode(self, item) -> Episode:
-        server_path = self._file(item)
-        return Episode(
-            id=str(item["ratingKey"]),
-            season=item.get("parentIndex") or 0,
-            number=item.get("index") or 0,
-            name=item.get("title", ""),
-            path=self.path_map.to_local(server_path),
-            server_path=server_path,
-        )
-
-    def _sections(self, kind):
-        return [d["key"] for d in self._call("GET", "/library/sections").get("Directory", [])
-                if d.get("type") == kind]
-
-    def titles(self) -> list[Title]:
-        titles = []
-        for plex_type, kind in (("movie", "movie"), ("show", "show")):
-            for key in self._sections(plex_type):
-                for item in self._call("GET", f"/library/sections/{key}/all").get("Metadata", []):
-                    server_path = self._file(item) if kind == "movie" else None
-                    titles.append(Title(
-                        id=str(item["ratingKey"]), kind=kind, name=item.get("title", ""),
-                        year=item.get("year"),
-                        path=self.path_map.to_local(server_path), server_path=server_path,
-                    ))
-        return sorted(titles, key=lambda t: t.name.lower())
-
-    def episodes_by_show(self) -> dict[str, list[Episode]]:
-        by_show: dict[str, list[Episode]] = {}
-        for key in self._sections("show"):
-            container = self._call("GET", f"/library/sections/{key}/all", params={"type": 4})
-            for item in container.get("Metadata", []):
-                by_show.setdefault(str(item.get("grandparentRatingKey", "")), []).append(self._episode(item))
-        return {show: _by_episode(episodes) for show, episodes in by_show.items()}
-
-    def episodes(self, show_id: str) -> list[Episode]:
-        container = self._call("GET", f"/library/metadata/{show_id}/allLeaves")
-        episodes = [self._episode(item) for item in container.get("Metadata", [])]
-        return _by_episode(episodes)
-
-    def poster(self, item_id: str):
-        response = self._call("GET", f"/library/metadata/{item_id}/thumb", raw=True, timeout=POSTER_TIMEOUT)
-        return response.content, response.headers.get("Content-Type", "image/jpeg")
-
-    def refresh(self, item_id: str):
-        self._call("PUT", f"/library/metadata/{item_id}/refresh", raw=True)
+        })
 
 
 def configured_servers(env=os.environ) -> dict:
-    """The media servers whose URL is set, keyed by name, in switcher order."""
+    """The media servers configured by their URL, keyed by name, in switcher order.
+
+    Jellyfin is the only media server this backend knows, so an environment
+    that sets no JELLYFIN_URL configures no server, whatever else it sets."""
     servers = {}
     if env.get("JELLYFIN_URL"):
         servers["jellyfin"] = Jellyfin(env["JELLYFIN_URL"], env.get("JELLYFIN_API_KEY", ""),
                                        PathMap(env.get("JELLYFIN_PATH_MAP", "")))
-    if env.get("PLEX_URL"):
-        servers["plex"] = Plex(env["PLEX_URL"], env.get("PLEX_TOKEN", ""),
-                               PathMap(env.get("PLEX_PATH_MAP", "")))
     return servers

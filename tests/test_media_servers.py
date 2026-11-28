@@ -2,7 +2,7 @@ import pytest
 
 from conftest import (FakeHttp, FakeJellyfinHttp, JELLYFIN_EPISODES, JELLYFIN_ITEMS, JELLYFIN_LIBRARIES,
                       SEVERANCE_EPISODES, jellyfin_routes)
-from media_servers import MEDIA_FOLDER, Jellyfin, MediaServerError, PathMap, Plex, configured_servers
+from media_servers import MEDIA_FOLDER, Jellyfin, MediaServerError, PathMap, configured_servers
 
 
 def test_a_server_path_maps_to_the_backend_media_folder():
@@ -211,84 +211,24 @@ def test_a_jellyfin_error_is_reported():
         Jellyfin("http://jf", "bad", PathMap(""), FakeHttp({})).titles()
 
 
-PLEX_ROUTES = {
-    ("GET", "/library/sections"): {"MediaContainer": {"Directory": [
-        {"key": "1", "type": "movie", "title": "Movies"},
-        {"key": "2", "type": "show", "title": "TV"},
-    ]}},
-    ("GET", "/library/sections/1/all"): {"MediaContainer": {"Metadata": [
-        {"ratingKey": 10, "title": "Arrival", "year": 2016, "type": "movie",
-         "Media": [{"Part": [{"file": "/data/media/Movies/Arrival.mkv"}]}]},
-    ]}},
-    ("GET", "/library/sections/2/all"): {"MediaContainer": {"Metadata": [
-        {"ratingKey": 20, "title": "Severance", "year": 2022, "type": "show"},
-    ]}},
-    ("GET", "/library/metadata/20/allLeaves"): {"MediaContainer": {"Metadata": [
-        {"ratingKey": 22, "title": "Half Loop", "index": 2, "parentIndex": 1,
-         "Media": [{"Part": [{"file": "/data/media/TV/S01E02.mkv"}]}]},
-        {"ratingKey": 21, "title": "Good News", "index": 1, "parentIndex": 1,
-         "Media": [{"Part": [{"file": "/data/media/TV/S01E01.mkv"}]}]},
-    ]}},
-    ("GET", "/library/metadata/10/thumb"): b"plex-poster",
-    ("PUT", "/library/metadata/10/refresh"): b"",
-}
-
-
-def plex(http=None):
-    return Plex("http://plex:32400", "tok", PathMap("/data/media:/media"), http or FakeHttp(dict(PLEX_ROUTES)))
-
-
-def test_plex_lists_movies_and_shows_with_backend_paths():
-    assert [(t.id, t.kind, t.name, t.year, t.path) for t in plex().titles()] == [
-        ("10", "movie", "Arrival", 2016, "/media/Movies/Arrival.mkv"),
-        ("20", "show", "Severance", 2022, None),
-    ]
-
-
-def test_plex_sends_its_token():
-    http = FakeHttp(dict(PLEX_ROUTES))
-    plex(http).titles()
-    assert http.calls[0]["headers"]["X-Plex-Token"] == "tok"
-
-
-def test_plex_episodes_are_ordered_with_backend_paths():
-    assert [(e.id, e.season, e.number, e.path) for e in plex().episodes("20")] == [
-        ("21", 1, 1, "/media/TV/S01E01.mkv"),
-        ("22", 1, 2, "/media/TV/S01E02.mkv"),
-    ]
-
-
-def test_plex_poster_and_refresh():
-    http = FakeHttp(dict(PLEX_ROUTES))
-    server = plex(http)
-    assert server.poster("10") == (b"plex-poster", "image/png")
-    server.refresh("10")
-    assert http.calls[-1]["method"] == "PUT"
-
-
-def test_only_servers_with_a_url_are_configured():
+def test_only_a_jellyfin_url_configures_a_server():
+    """PLEX_URL configures nothing: Jellyfin is the only media server."""
     assert list(configured_servers({})) == []
-    assert list(configured_servers({"PLEX_URL": "http://p"})) == ["plex"]
-    assert list(configured_servers({"JELLYFIN_URL": "http://j", "PLEX_URL": "http://p"})) == ["jellyfin", "plex"]
+    assert list(configured_servers({"PLEX_URL": "http://p", "PLEX_TOKEN": "tok"})) == []
+    assert list(configured_servers({"JELLYFIN_URL": "http://j"})) == ["jellyfin"]
 
 
-def test_plex_groups_all_episodes_by_show():
-    class EpisodeAwareHttp(FakeHttp):
-        def request(self, method, url, params=None, headers=None, timeout=None):
-            if url.endswith("/library/sections/2/all") and params == {"type": 4}:
-                self.routes[("GET", "/library/sections/2/all")] = {"MediaContainer": {"Metadata": [
-                    {"ratingKey": 21, "grandparentRatingKey": 20, "index": 1, "parentIndex": 1,
-                     "title": "Good News", "Media": [{"Part": [{"file": "/data/media/TV/S01E01.mkv"}]}]},
-                ]}}
-            return super().request(method, url, params, headers, timeout)
+def test_the_environment_read_ignores_a_stale_plex_url(monkeypatch):
+    """An operator whose .env still sets PLEX_URL: the server list built from the
+    process environment holds no server, so the backend starts and ignores it."""
+    monkeypatch.setenv("PLEX_URL", "http://plex:32400")
+    monkeypatch.setenv("PLEX_TOKEN", "tok")
+    monkeypatch.delenv("JELLYFIN_URL", raising=False)
 
-    by_show = plex(EpisodeAwareHttp(dict(PLEX_ROUTES))).episodes_by_show()
-
-    assert [(e.id, e.path) for e in by_show["20"]] == [("21", "/media/TV/S01E01.mkv")]
+    assert configured_servers() == {}
 
 
-@pytest.mark.parametrize("make", [jellyfin, plex])
-def test_posters_give_up_quickly_on_a_hung_server(make):
-    http = FakeJellyfinHttp(jellyfin_routes()) if make is jellyfin else FakeHttp(dict(PLEX_ROUTES))
-    make(http).poster("m1" if make is jellyfin else "10")
+def test_posters_give_up_quickly_on_a_hung_server():
+    http = FakeJellyfinHttp(jellyfin_routes())
+    jellyfin(http).poster("m1")
     assert http.calls[-1]["timeout"] <= 5

@@ -3,6 +3,9 @@ import subprocess
 
 import jobs
 import main
+from fastapi.testclient import TestClient
+from media_servers import configured_servers
+
 from conftest import SAMPLE_SRT
 
 
@@ -76,6 +79,18 @@ def test_posters_come_through_the_backend_without_the_key(library):
 
 def test_an_unconfigured_server_is_reported(library):
     assert library.client.get("/library/plex").status_code == 404
+
+
+def test_a_stale_plex_url_configures_no_server(monkeypatch):
+    """An operator whose .env still sets PLEX_URL gets a backend that starts
+    normally and ignores it: /config lists no server, and /library/plex answers
+    404 like any server that was never configured."""
+    monkeypatch.setattr(main, "SERVERS",
+                        configured_servers({"PLEX_URL": "http://plex:32400", "PLEX_TOKEN": "tok"}))
+    client = TestClient(main.app)
+
+    assert client.get("/config").json()["servers"] == []
+    assert client.get("/library/plex").status_code == 404
 
 
 def test_queued_movie_is_translated_and_refreshed_in_the_server(library):

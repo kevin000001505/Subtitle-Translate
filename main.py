@@ -921,7 +921,8 @@ def history_endpoint(limit: int = 200):
 
 # ================= LIBRARY JOBS =================
 
-# Media servers configured in .env (JELLYFIN_URL / PLEX_URL), in switcher order.
+# The media server configured in .env (JELLYFIN_URL), in switcher order:
+# at most one, because Jellyfin is the only media server this backend talks to.
 SERVERS = configured_servers()
 LIBRARY_TTL_SECONDS = 120
 _library_cache: dict = {}   # server name -> (fetched_at, titles, episodes_by_show)

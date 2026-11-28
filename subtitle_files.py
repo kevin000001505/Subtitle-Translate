@@ -57,7 +57,7 @@ def strip_source_suffix(path: str) -> str:
 
 
 def sidecar_subtitle_path(video_path: str, lang: str = DEFAULT_TARGET_LANG) -> str:
-    """`Video.<lang>.srt` next to the video: the name Jellyfin and Plex pick up."""
+    """`Video.<lang>.srt` next to the video: the name Jellyfin picks up."""
     return f"{os.path.splitext(video_path)[0]}{subtitle_suffix(lang)}"
 
 
