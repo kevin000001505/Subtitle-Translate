@@ -1,9 +1,10 @@
 import asyncio
 import subprocess
 
+from fastapi.testclient import TestClient
+
 import jobs
 import main
-from fastapi.testclient import TestClient
 from media_servers import configured_servers
 
 from conftest import SAMPLE_SRT

@@ -130,9 +130,9 @@ class Jellyfin:
 
     @property
     def media_folder(self) -> str:
-        """The media folder this server's files live in, as this backend names it.
+        """The media folder Jellyfin's files live in, as this backend names it.
 
-        A server with no path-map rule names the container's mount, so an error
+        Jellyfin with no path-map rule names the container's mount, so an error
         about the media folder always names a folder."""
         return ", ".join(self.path_map.local_roots()) or MEDIA_FOLDER
 
@@ -240,8 +240,7 @@ class Jellyfin:
         return _by_episode(episodes)
 
     def poster(self, item_id: str):
-        """The poster bytes and their content type, with a short timeout: a hung
-        server must not hold a browser connection for long."""
+        """The poster bytes and their content type, asked for with POSTER_TIMEOUT."""
         response = self._send("GET", f"/Items/{item_id}/Images/Primary",
                               params={"fillHeight": 450, "quality": 90}, timeout=POSTER_TIMEOUT)
         return response.content, response.headers.get("Content-Type", "image/jpeg")
@@ -255,7 +254,7 @@ class Jellyfin:
         })
 
 
-def configured_servers(env=os.environ) -> dict:
+def configured_servers(env=os.environ) -> dict[str, Jellyfin]:
     """The media servers configured by their URL, keyed by name, in switcher order.
 
     Jellyfin is the only media server this backend knows, so an environment
